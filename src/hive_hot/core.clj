@@ -14,27 +14,24 @@
 ;; Registry
 ;; =============================================================================
 
-(defonce ^:private registry
-  "Registry of hot-reloadable components.
+;; Registry of hot-reloadable components.
+;;
+;; Structure:
+;; {component-id {:ns symbol
+;;                :on-reload fn
+;;                :on-error fn
+;;                :status :idle|:reloading|:error
+;;                :last-reload instant}}
+(defonce ^:private registry (atom {}))
 
-   Structure:
-   {component-id {:ns symbol
-                  :on-reload fn
-                  :on-error fn
-                  :status :idle|:reloading|:error
-                  :last-reload instant}}"
-  (atom {}))
+;; Reload event listeners.
+;;
+;; Structure:
+;; {listener-id (fn [event] ...)}
+(defonce ^:private listeners (atom {}))
 
-(defonce ^:private listeners
-  "Reload event listeners.
-
-   Structure:
-   {listener-id (fn [event] ...)}"
-  (atom {}))
-
-(defonce ^:private initialized?
-  "Track if clj-reload has been initialized."
-  (atom false))
+;; Track if clj-reload has been initialized.
+(defonce ^:private initialized? (atom false))
 
 ;; =============================================================================
 ;; Initialization
@@ -231,12 +228,12 @@
    :components @registry
    :listener-count (count @listeners)})
 
-(defn reset!
+(defn reset-all!
   "Reset all registrations. Use in tests."
   []
-  (reset! registry {})
-  (reset! listeners {})
-  (reset! initialized? false)
+  (clojure.core/reset! registry {})
+  (clojure.core/reset! listeners {})
+  (clojure.core/reset! initialized? false)
   nil)
 
 ;; =============================================================================

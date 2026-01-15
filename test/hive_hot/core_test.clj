@@ -8,9 +8,9 @@
 ;; =============================================================================
 
 (defn reset-fixture [f]
-  (hot/reset!)
+  (hot/reset-all!)
   (f)
-  (hot/reset!))
+  (hot/reset-all!))
 
 (use-fixtures :each reset-fixture)
 
