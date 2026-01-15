@@ -1,0 +1,19 @@
+# Clojure
+.cpcache/
+.nrepl-port
+*.class
+*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.calva/
+
+# OS
+.DS_Store
+*~
+
+# Project
+target/
+vendor/
