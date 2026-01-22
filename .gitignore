@@ -17,3 +17,6 @@
 # Project
 target/
 vendor/
+
+.clj-kondo/
+.lsp/
