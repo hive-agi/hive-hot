@@ -1,0 +1,1 @@
+["^ ","~$doubled",["^ ","~:row",5,"~:col",1,"~:fixed-arities",["~#set",[0]],"~:name","^0","~:ns","~$fixtures.integration.beta","~:top-ns","^7","~:arities",["^ ","~i0",["^ ","~:ret","~:number","~:arglist-str","[]"]],"~:type","~:fn"],"~:filename","/home/lages/dotfiles/gitthings/hive-hot/test/fixtures/integration/beta.clj"]

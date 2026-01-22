@@ -1,0 +1,1 @@
+["^ ","~$value",["^ ","~:row",4,"~:col",1,"~:name","^0","~:ns","~$fixtures.integration.alpha","~:top-ns","^5","~:type","~:pos-int"],"~$get-value",["^ ","^1",6,"^2",1,"~:fixed-arities",["~#set",[0]],"^3","^9","^4","^5","^6","^5","^7","~:fn"],"~:filename","/home/lages/dotfiles/gitthings/hive-hot/test/fixtures/integration/alpha.clj"]

@@ -368,10 +368,11 @@
                        (fn [{:keys [file type]}]
                          (handle-event! debouncer {:file file :type type})))
 
-       ;; Store state for cleanup
+       ;; Store state for cleanup (include dirs for introspection)
        (reset! watcher-state
                {:watcher watcher
                 :debouncer debouncer
+                :dirs dirs
                 :stop-fn (fn []
                            (watcher-stop! watcher)
                            (stop-debouncer! debouncer)
@@ -394,5 +395,12 @@
    - :watching? true
    - :dirs watched directories"
   []
-  (when @watcher-state
-    {:watching? true}))
+  (when-let [state @watcher-state]
+    {:watching? true
+     :dirs (:dirs state)}))
+
+(defn watching-paths
+  "Get list of directories being watched.
+   Returns empty vector if not watching."
+  []
+  (or (:dirs @watcher-state) []))

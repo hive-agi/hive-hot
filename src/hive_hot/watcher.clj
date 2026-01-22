@@ -3,7 +3,9 @@
    
    Provides file system watching for hot-reload coordination.
    Uses Java WatchService for cross-platform file event detection."
-  (:import [java.nio.file FileSystems Path Paths StandardWatchEventKinds WatchKey]
+  (:import [java.nio.file FileSystems Path Paths StandardWatchEventKinds WatchKey
+            Files FileVisitResult SimpleFileVisitor]
+           [java.nio.file.attribute BasicFileAttributes]
            [java.util.concurrent TimeUnit]))
 
 ;; =============================================================================
@@ -40,13 +42,37 @@
     (Paths/get (str p) (into-array String []))))
 
 (defn- register-path!
-  "Register a path with the watch service."
+  "Register a single path with the watch service."
   [^java.nio.file.WatchService service path]
   (let [^Path p (path->Path path)]
     (.register p service
                (into-array [StandardWatchEventKinds/ENTRY_MODIFY
                             StandardWatchEventKinds/ENTRY_CREATE
                             StandardWatchEventKinds/ENTRY_DELETE]))))
+
+(defn- register-recursive!
+  "Register a path and all subdirectories with the watch service.
+
+   Java WatchService only watches immediate directory contents, NOT subdirectories.
+   This function walks the directory tree and registers each directory.
+
+   CLARITY-Y: Gracefully handles permission errors and missing directories."
+  [^java.nio.file.WatchService service path key->path-atom]
+  (let [root-path (path->Path path)]
+    (when (Files/isDirectory root-path (into-array java.nio.file.LinkOption []))
+      (Files/walkFileTree
+       root-path
+       (proxy [SimpleFileVisitor] []
+         (preVisitDirectory [^Path dir ^BasicFileAttributes _attrs]
+           (try
+             (let [key (register-path! service (str dir))]
+               (swap! key->path-atom assoc key (str dir)))
+             (catch Exception e
+               (println "Could not register directory:" (str dir) "-" (.getMessage e))))
+           FileVisitResult/CONTINUE)
+         (visitFileFailed [^Path _file ^java.io.IOException _exc]
+           ;; Skip files/dirs we can't access
+           FileVisitResult/CONTINUE))))))
 
 (defn- process-events!
   "Process events from a watch key, calling callback for each."
@@ -94,10 +120,10 @@
                  (do (reset! started? true)
                      {:running? true}))))
       (when @started?
-        ;; Register all paths
+        ;; Register all paths RECURSIVELY - Java WatchService only watches immediate dir
+        ;; FIX: Walk subdirectories to detect changes in nested source files
         (doseq [path paths]
-          (let [key (register-path! service path)]
-            (swap! key->path assoc key path)))
+          (register-recursive! service path key->path))
         ;; Start watch thread
         (let [thread (Thread.
                       (fn [] (watch-loop service state callback key->path))
