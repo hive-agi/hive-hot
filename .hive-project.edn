@@ -1,0 +1,3 @@
+{:project-id "hive-hot"
+ :parent "hive-mcp"
+ :description "Hot-reload extensions for hive-mcp development"}
