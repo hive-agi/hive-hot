@@ -1,10 +1,10 @@
 {:paths ["src" "resources"]
 
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
-        io.github.tonsky/clj-reload {:mvn/version "0.7.1"}
+        io.github.tonsky/clj-reload {:mvn/version "1.0.0"}
         org.clojure/core.async {:mvn/version "1.6.681"}
         io.github.hive-agi/hive-events
-        {:git/tag "v0.1.0" :git/sha "240a09e"}}
+        {:git/tag "v0.4.0" :git/sha "e3d9f7c"}}
 
  :aliases
  {:dev {:extra-paths ["dev" "test"]

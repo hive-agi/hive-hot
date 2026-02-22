@@ -20,3 +20,4 @@ vendor/
 
 .clj-kondo/
 .lsp/
+local.deps.edn

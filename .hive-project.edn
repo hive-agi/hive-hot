@@ -1,3 +1,5 @@
 {:project-id "hive-hot"
- :parent "hive-mcp"
- :description "Hot-reload extensions for hive-mcp development"}
+ :parent "hive"
+ :description "Hot-reload module for hive-mcp"
+ :language :clojure
+ :tags ["hot-reload" "dev"]}
