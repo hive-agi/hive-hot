@@ -4,7 +4,7 @@
         io.github.tonsky/clj-reload {:mvn/version "1.0.0"}
         org.clojure/core.async {:mvn/version "1.6.681"}
         io.github.hive-agi/hive-events
-        {:mvn/version "0.5.4"}}
+        {:mvn/version "0.5.5"}}
 
  :aliases
  {:build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.9"}
@@ -14,7 +14,7 @@
   :dev {:extra-paths ["dev" "test"]
         :extra-deps {nrepl/nrepl {:mvn/version "1.7.0"}
                      ;; For local dev, override with local hive-events
-                     io.github.hive-agi/hive-events {:mvn/version "0.5.4"}}}
+                     io.github.hive-agi/hive-events {:mvn/version "0.5.5"}}}
 
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
