@@ -1,6 +1,6 @@
 {:paths ["src" "resources"]
 
- :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+ :deps {org.clojure/clojure {:mvn/version "1.12.5"}
         io.github.tonsky/clj-reload {:mvn/version "1.0.0"}
         org.clojure/core.async {:mvn/version "1.6.681"}
         io.github.hive-agi/hive-events
