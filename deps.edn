@@ -2,7 +2,7 @@
 
  :deps {org.clojure/clojure {:mvn/version "1.12.5"}
         io.github.tonsky/clj-reload {:mvn/version "1.0.0"}
-        org.clojure/core.async {:mvn/version "1.6.681"}
+        org.clojure/core.async {:mvn/version "1.9.865"}
         io.github.hive-agi/hive-events
         {:mvn/version "0.5.6"}}
 
