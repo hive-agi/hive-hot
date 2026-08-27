@@ -2,4 +2,4 @@
  :parent "hive"
  :description "Hot-reload module for hive-mcp"
  :language :clojure
- :tags ["hot-reload" "dev"]}
+ :tags ["hot-reload" "dev"] :carto {:source-roots ["src" "test"]}}
