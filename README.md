@@ -146,7 +146,9 @@ Configure source directories and exclusions:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `init!` | `([] [opts])` | Initialize clj-reload. Options: `:dirs`, `:no-reload`, `:no-unload` |
+| `init!` | `([] [opts])` | Initialize clj-reload. Options: `:dirs`, `:no-reload`, `:no-unload`, `:since` (epoch ms the change baseline starts from; pass the JVM start time so edits made before init count as changes) |
+| `ensure-init!` | `[opts]` | `init!` when uninitialized, else `extend-init!`: idempotent for hosts |
+| `extend-init!` | `[opts]` | Add `:dirs` / `:no-reload` / `:no-unload` to an initialized registry WITHOUT resetting the baseline; restarts a running watcher over the union |
 
 ### Component Registry
 
@@ -161,7 +163,9 @@ Configure source directories and exclusions:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `reload!` | `([] [opts])` | Reload changed namespaces. Opts: `:throw`, `:only` |
+| `reload!` | `([] [opts])` | Reload every pending change under every tracked dir (a scoped reload with no roots). Opts: `:throw`, `:only` (clj-reload's explicit selection, bypasses the baseline) |
+| `reload-scoped!` | `([roots] [roots opts])` | Reload the changes under `roots` only: their dependents are dragged in (`:dragged`), every other change is DECLINED (`:skipped`) and stays pending for the reload that owns its root. Also reports `:unchanged?` and `:multi-file` (a loaded namespace found in more than one file) |
+| `scope-plan` | `[roots]` | Effect-free preview of what `reload-scoped!` would load, drag and skip |
 | `reload-all!` | `[]` | Force reload all namespaces |
 
 ### Event Listeners
