@@ -7,7 +7,7 @@
         {:mvn/version "0.5.10"}}
 
  :aliases
- {:build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.10"}}
+ {:build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.11"}}
           :ns-default hive-build.api}
 
   :dev {:extra-paths ["dev" "test"]
