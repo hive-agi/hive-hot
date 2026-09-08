@@ -1,5 +1,11 @@
 # hive-hot
 
+Failed namespace reload results include a hive-help `:diagnostic` with a stable
+`:code`, explanatory `:message`, `:retryable false`, and suggested `:actions`.
+The original exception, failed namespace, and loaded/unloaded progress remain
+available. A failure can follow partial execution: inspect and fix the cause
+before retrying the same scope. Successful reload results are unchanged.
+
 <!-- hive-badges -->
 
 [![Clojars Project](https://img.shields.io/clojars/v/io.github.hive-agi/hive-hot.svg)](https://clojars.org/io.github.hive-agi/hive-hot)

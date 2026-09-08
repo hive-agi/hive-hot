@@ -13,7 +13,8 @@
      (clj-reload keeps one scalar :since for the whole image)
 
    Design: Composition over reimplementation."
-  (:require [clj-reload.core :as reload]
+  (:require [hive-hot.diagnostic :as diagnostic]
+            [clj-reload.core :as reload]
             [clj-reload.parse :as parse]
             [clojure.java.io :as io]
             [hive-hot.events :as events])
@@ -364,8 +365,9 @@
                     :failed (:failed result)
                     :error (:exception result)})
           (events/emit-reload-error! (:failed result) (:exception result))))
-    (cond-> (merge result {:success success? :ms elapsed})
-      (:exception result) (assoc :error (ex-message (:exception result))))))
+    (diagnostic/reload-outcome
+      (cond-> (merge result {:success success? :ms elapsed})
+      (:exception result) (assoc :error (ex-message (:exception result)))))))
 
 (defn reload-scoped!
   "Reload the changes under `roots` — and only those.
