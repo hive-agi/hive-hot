@@ -258,6 +258,10 @@
                                         cascade must recompile it anyway
       :skipped   [File ...]             changed outside, unrelated — DECLINED;
                                         stays pending for its own root
+      :cascade   [ns ...]              tracked require-graph closure, INCLUDING
+                                        unchanged dependents; potential namespace
+                                        reloads, before live/no-reload filtering.
+                                        Untracked namespaces are not covered.
       :mask      #{ns ...}              namespaces pinned :no-reload for the run
       :since     long | nil             the :since window the run needs, nil
                                         when there is nothing to load
@@ -286,11 +290,16 @@
         admitted  (into (set want) dragged)
         window    (when (seq admitted)
                     (dec (transduce (map mtime) min Long/MAX_VALUE admitted)))
-        exposed   (when window (filter #(> (mtime %) window) all))
+        ;; run-clj-reload! scans from the EARLIER of the old baseline and
+        ;; the admitted window. Mask that same interval, including unrelated
+        ;; edits saved before the requested files.
+        scan-since (when window (min old-since window))
+        exposed   (when scan-since (filter #(> (mtime %) scan-since) all))
         mask      (into #{}
                         (comp (remove admitted) (mapcat nses-of) (remove closure))
                         exposed)]
     {:roots roots* :want want :dragged dragged :skipped (vec skipped)
+     :cascade (vec (sort closure))
      :mask mask :since window :old-since old-since}))
 
 (defn- run-clj-reload!
@@ -472,14 +481,36 @@
 ;; Status & Introspection
 ;; =============================================================================
 
+(defn- component-row
+  "Project one registry entry to wire-safe data.
+
+   The registry holds the LIVE :on-reload / :on-error closures, and a status
+   report is read by callers that serialize it, where a function is not a datum
+   but a crash. The failure is also badly misleading: the only name in the error
+   is the closure's class, so it accuses whoever registered the callback rather
+   than the report that tried to carry it. What a reader can act on is WHETHER a
+   callback is installed, never the object, so that is what this reports."
+  [{:keys [ns on-reload on-error status last-reload]}]
+  {:ns (str ns)
+   :status status
+   :last-reload last-reload
+   :on-reload? (some? on-reload)
+   :on-error? (some? on-error)})
+
 (defn status
   "Get current hot-reload status.
 
+   Every value here is DATA: the report crosses process and serialization
+   boundaries (an MCP tool surface renders it as JSON), so live objects are
+   projected rather than handed over. Callers that need the actual callbacks
+   read the registry, not the report.
+
    Returns:
    {:initialized? bool
-    :components {...}
+    :components {component-id {:ns str :status kw :last-reload ms
+                               :on-reload? bool :on-error? bool}}
     :listener-count n
-    :dirs [...]           tracked source dirs (when initialized)
+    :dirs [str ...]       tracked source dirs (when initialized)
     :since ms             clj-reload's change baseline (when initialized)
     :pending [ns ...]     namespaces changed on disk that no reload has loaded
                           yet (when initialized)}"
@@ -488,9 +519,9 @@
         plan  (when init? (scope-plan nil))
         state (when init? (reload-state))]
     (cond-> {:initialized? init?
-             :components @registry
+             :components (update-vals @registry component-row)
              :listener-count (count @listeners)}
-      init? (assoc :dirs (vec (:dirs (reload-config)))
+      init? (assoc :dirs (mapv str (:dirs (reload-config)))
                    :since (:old-since plan)
                    :pending (into []
                                   (comp (mapcat #(file-namespaces state %))

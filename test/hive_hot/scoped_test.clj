@@ -82,7 +82,8 @@
   (reload-fixtures!)
   (write! alpha-file (alpha-src 42))
   (write! gamma-file (gamma-src 99))
-  (let [r (hot/reload-scoped! [root-a])]
+  (let [plan (hot/scope-plan [root-a])
+        r (hot/reload-scoped! [root-a])]
     (is (:success r) (pr-str r))
     (is (true? (:scoped? r)))
     (is (false? (:unchanged? r)))
@@ -96,7 +97,32 @@
       (is (not (contains? (set (:loaded r)) 'fixtures.scoped.gamma)))
       (is (= 1 (current 'fixtures.scoped.gamma/value))))
     (testing "an unchanged dependent outside the roots is not reported as dragged"
-      (is (empty? (:dragged r))))))
+      (is (empty? (:dragged r))))
+    (testing "the preview names the full tracked namespace cascade, including unchanged delta"
+      (is (= '#{fixtures.integration.alpha fixtures.integration.beta fixtures.scoped.delta}
+             (set (:cascade plan))))
+      (is (every? (set (:cascade plan)) (:loaded r))))))
+
+(deftest an-earlier-unrelated-edit-is-masked-across-the-actual-scan-window
+  (hot/init! {:dirs [root-a root-b]})
+  (reload-fixtures!)
+  ;; The co-tenant saves FIRST. Its mtime is after clj-reload's baseline,
+  ;; but before the requested root's new reload window.
+  (write! gamma-file (gamma-src 99))
+  (write! alpha-file (alpha-src 42))
+  (let [plan (hot/scope-plan [root-a])]
+    (is (contains? (:mask plan) 'fixtures.scoped.gamma))
+    (is (empty? (:dragged plan))))
+  (let [report (hot/reload-scoped! [root-a])]
+    (is (:success report) (pr-str report))
+    (is (= ["fixtures.scoped.gamma"] (:skipped report)))
+    (is (not (contains? (set (:loaded report)) 'fixtures.scoped.gamma)))
+    (is (= 1 (current 'fixtures.scoped.gamma/value)))
+    (is (= 42 (current 'fixtures.integration.alpha/value)))
+    (is (contains? (set (:pending (hot/status))) "fixtures.scoped.gamma")))
+  (let [report (hot/reload-scoped! [root-b])]
+    (is (:success report) (pr-str report))
+    (is (= 99 (current 'fixtures.scoped.gamma/value)))))
 
 (deftest a-declined-change-stays-pending-for-its-own-root
   (hot/init! {:dirs [root-a root-b]})
