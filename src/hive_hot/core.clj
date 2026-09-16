@@ -323,6 +323,31 @@
                      'clj-reload.core/scan)
          :exception t}))))
 
+(defn- stale-registrations
+  "Handlers still registered from code this pass replaced.
+
+   A registration captures a function VALUE: `(reg-fx :k handle-k)` puts the fn
+   object in a registry that lives outside the namespace being reloaded. When
+   the form that registers is guarded so it runs once, under a `defonce` or
+   behind an `initialized?` flag, clj-reload preserves the guard, the namespace
+   loads its new code, and the registry keeps invoking the old closure.
+
+   Nothing else in this report can see that. The namespace appears in :loaded,
+   its vars carry the new arglists, and the behaviour does not change. So the
+   pass asks hive-events which of its registry entries no longer match the var
+   they came from, restricted to the namespaces this pass actually reloaded.
+
+   Soft-resolved on purpose: an older hive-events has no such scan, and a reload
+   must not fail because its report could not be enriched. The vars are dropped
+   from each row so the answer stays printable."
+  [loaded]
+  (when (seq loaded)
+    (try
+      (when-let [scan (requiring-resolve 'hive.events.staleness/stale-entries)]
+        (seq (mapv #(select-keys % [:registry :id :owner])
+                   (scan {:namespaces loaded}))))
+      (catch Throwable _ nil))))
+
 (defn- record-loaded!
   "Advance the per-file baseline after a pass. A file whose namespace loaded is
    now seen at the mtime clj-reload read it at; so is a file whose namespaces
@@ -359,10 +384,16 @@
 
 (defn- finish!
   "Common tail of every reload pass: component callbacks, listeners, events,
-   and the result map hive-hot answers with."
+   and the result map hive-hot answers with.
+
+   The result also carries :stale-registrations when the pass left a registry
+   entry pointing at code it just replaced. That is the one failure this report
+   could not otherwise show: loading succeeds, the namespace is listed, and the
+   old closure keeps running."
   [result start]
   (let [elapsed  (- (System/currentTimeMillis) start)
-        success? (nil? (:failed result))]
+        success? (nil? (:failed result))
+        stale    (stale-registrations (:loaded result))]
     (run-component-callbacks! result)
     (if success?
       (do (notify! {:type :reload-success
@@ -376,7 +407,8 @@
           (events/emit-reload-error! (:failed result) (:exception result))))
     (diagnostic/reload-outcome
       (cond-> (merge result {:success success? :ms elapsed})
-      (:exception result) (assoc :error (ex-message (:exception result)))))))
+      (:exception result) (assoc :error (ex-message (:exception result)))
+      stale               (assoc :stale-registrations stale)))))
 
 (defn reload-scoped!
   "Reload the changes under `roots` — and only those.
@@ -429,11 +461,11 @@
   "Reload changed namespaces and their dependents.
 
    Without :only this is `(reload-scoped! nil opts)`: every change the
-   registry's per-file baseline has not seen, under every tracked dir — which
+   registry's per-file baseline has not seen, under every tracked dir -- which
    includes the changes an earlier SCOPED reload declined.
 
    Options:
-   - :only  - :loaded | :all | #\"pattern\" — clj-reload's explicit selection,
+   - :only  - :loaded | :all | #\"pattern\" -- clj-reload's explicit selection,
               passed straight through (bypasses the baseline)
    - :throw - Throw on error (default: false, returns result map)
 
@@ -448,6 +480,10 @@
     :failed ns-or-nil
     :error message-or-nil
     :exception throwable-or-nil
+    :stale-registrations [{:registry :fx :id k :owner ns/name} ...] -- present
+      only when the pass left a hive-events registry entry holding a function
+      from code it just replaced, which happens when the registration is
+      guarded so it runs once (see `stale-registrations`)
     :ms elapsed}
 
    Example:
