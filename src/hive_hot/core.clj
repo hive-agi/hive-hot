@@ -421,6 +421,10 @@
    stay pending for the reload that owns their root. `roots` nil or empty means
    every tracked dir.
 
+   A pass also runs when nothing under the roots changed but clj-reload holds
+   work an earlier pass left queued (a namespace unloaded and never loaded, or
+   one a caller queued): that work would otherwise wait for an unrelated edit.
+
    Returns clj-reload's result plus:
      :success    bool
      :ms         elapsed
@@ -428,33 +432,36 @@
      :roots      the canonical roots
      :skipped    [ns-string ...]  changed outside the roots, NOT loaded
      :dragged    [ns-string ...]  changed outside the roots, loaded as dependents
-     :unchanged? true when nothing under the roots had changed — no pass ran
+     :unchanged? true when nothing under the roots had changed
+     :pending?   true when the pass ran for queued work alone
      :multi-file {ns [path ...]}  loaded namespaces found in more than one file"
   ([roots] (reload-scoped! roots {}))
   ([roots opts]
    (ensure-initialized!)
    (notify! {:type :reload-start :opts (assoc opts :roots roots)})
    (events/emit-reload-start!)
-   (let [start   (System/currentTimeMillis)
-         state   (reload-state)
-         plan    (scope-plan roots)
-         nses-of (fn [files]
-                   (into [] (comp (mapcat #(file-namespaces state %)) (distinct) (map str))
-                         files))
-         skipped (nses-of (:skipped plan))
-         dragged (nses-of (:dragged plan))
-         result  (if (:since plan)
-                   (run-clj-reload! plan (select-keys opts [:log-fn]))
-                   {:unloaded [] :loaded []})
-         _       (record-loaded! (:old-since plan) (:loaded result))
-         multi   (multi-file-namespaces (:loaded result))
-         out     (finish! result start)]
+   (let [start    (System/currentTimeMillis)
+         state    (reload-state)
+         plan     (scope-plan roots)
+         pending? (boolean (or (seq (:to-load state)) (seq (:to-unload state))))
+         nses-of  (fn [files]
+                    (into [] (comp (mapcat #(file-namespaces state %)) (distinct) (map str))
+                          files))
+         skipped  (nses-of (:skipped plan))
+         dragged  (nses-of (:dragged plan))
+         result   (if (or (:since plan) pending?)
+                    (run-clj-reload! plan (select-keys opts [:log-fn]))
+                    {:unloaded [] :loaded []})
+         _        (record-loaded! (:old-since plan) (:loaded result))
+         multi    (multi-file-namespaces (:loaded result))
+         out      (finish! result start)]
      (cond-> (assoc out
                     :scoped? (some? (:roots plan))
                     :roots (or (:roots plan) [])
                     :skipped skipped
                     :dragged dragged
-                    :unchanged? (nil? (:since plan)))
+                    :unchanged? (nil? (:since plan))
+                    :pending? (and pending? (nil? (:since plan))))
        (seq multi) (assoc :multi-file multi)))))
 
 (defn reload!
@@ -608,10 +615,12 @@
 
 (defn extend-init!
   "Extend an initialized registry: union `dirs`, `no-reload` and `no-unload`
-   into clj-reload's config WITHOUT resetting the change baseline or the
-   per-file view — a change declined before this call is still pending after
-   it. No-op when nothing is new. Restarts the file watcher, when one is
-   running, over the union.
+   into clj-reload's config WITHOUT resetting the change baseline, the
+   per-file view, or the work a pass left pending — a change declined before
+   this call is still pending after it, a namespace an earlier pass unloaded
+   but never loaded is still queued, and a keep entry still stands. No-op when
+   nothing is new. Restarts the file watcher, when one is running, over the
+   union.
 
    Returns {:dirs [...] :added [...]}."
   [{:keys [dirs no-reload no-unload]}]
@@ -624,13 +633,24 @@
              (= no-reload' (set (:no-reload cfg)))
              (= no-unload' (set (:no-unload cfg))))
       {:dirs cur-dirs :added []}
-      (let [since (:since (reload-state))
+      (let [{:keys [since to-load to-unload namespaces]} (reload-state)
             dirs' (into cur-dirs added)]
         (reload/init {:dirs dirs' :no-reload no-reload' :no-unload no-unload'
                       :files (:files cfg) :reload-hook (:reload-hook cfg)
                       :unload-hook (:unload-hook cfg) :output (:output cfg)})
-        (when since
-          (swap! (state-atom) assoc :since since))
+        (swap! (state-atom)
+               (fn [s]
+                 (cond-> s
+                   since           (assoc :since since)
+                   (seq to-load)   (assoc :to-load (vec to-load))
+                   (seq to-unload) (assoc :to-unload (vec to-unload))
+                   true            (update :namespaces
+                                           (fn [nses]
+                                             (reduce-kv (fn [m ns {:keys [keep]}]
+                                                          (if (and (seq keep) (contains? m ns))
+                                                            (update-in m [ns :keep] #(merge keep %))
+                                                            m))
+                                                        nses namespaces))))))
         (when-let [opts (:opts @watcher-state)]
           (init-with-watcher! (assoc opts :dirs dirs')))
         {:dirs dirs' :added added}))))

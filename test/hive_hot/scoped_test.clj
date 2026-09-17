@@ -229,6 +229,37 @@
     (is (= [] (:added third)))
     (is (= [root-a root-b] (:dirs (hot/status))))))
 
+(deftest extend-init-keeps-the-work-a-pass-left-pending
+  (hot/init! {:dirs [root-a]})
+  (reload-fixtures!)
+  (let [state @(find-var 'clj-reload.core/*state)]
+    (swap! state assoc
+           :to-load ['fixtures.integration.beta]
+           :to-unload ['fixtures.integration.beta])
+    (swap! state assoc-in [:namespaces 'fixtures.integration.alpha :keep 'value] {:tag 'def})
+    (hot/extend-init! {:dirs [root-b]})
+    (let [s @state]
+      (is (= [root-a root-b] (:dirs (hot/status))))
+      (is (= ['fixtures.integration.beta] (:to-load s)) "queued loads survive the re-init")
+      (is (= ['fixtures.integration.beta] (:to-unload s)) "queued unloads survive the re-init")
+      (is (= {:tag 'def} (get-in s [:namespaces 'fixtures.integration.alpha :keep 'value]))
+          "a keep entry survives the re-init"))))
+
+(deftest a-scoped-reload-with-nothing-changed-still-runs-what-is-pending
+  (hot/init! {:dirs [root-a root-b]})
+  (reload-fixtures!)
+  ;; A pass that unloaded beta and stopped before loading it leaves beta gone
+  ;; from the image and queued in clj-reload.
+  (remove-ns 'fixtures.integration.beta)
+  (dosync (alter @#'clojure.core/*loaded-libs* disj 'fixtures.integration.beta))
+  (swap! @(find-var 'clj-reload.core/*state) assoc :to-load ['fixtures.integration.beta])
+  (let [r (hot/reload-scoped! [root-a])]
+    (is (:success r) (pr-str r))
+    (is (true? (:pending? r)))
+    (is (true? (:unchanged? r)) "nothing under the root changed")
+    (is (= ['fixtures.integration.beta] (:loaded r)))
+    (is (some? (find-ns 'fixtures.integration.beta)))))
+
 (deftest a-namespace-shadowed-by-a-second-file-is-reported
   (testing "two files declare fixtures.scoped.gamma; the reload loads both and
             names the namespace, because whichever file loaded last decides the
