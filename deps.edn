@@ -4,17 +4,17 @@
         io.github.tonsky/clj-reload {:mvn/version "1.0.0"}
         org.clojure/core.async {:mvn/version "1.9.865"}
         io.github.hive-agi/hive-events
-        {:mvn/version "0.5.14"}
+        {:mvn/version "0.5.16"}
         io.github.hive-agi/hive-help {:mvn/version "0.1.4"}}
 
  :aliases
- {:build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.18"}}
+ {:build {:deps {io.github.hive-agi/hive-build {:mvn/version "0.1.19"}}
           :ns-default hive-build.api}
 
   :dev {:extra-paths ["dev" "test"]
         :extra-deps {nrepl/nrepl {:mvn/version "1.7.0"}
                      ;; For local dev, override with local hive-events
-                     io.github.hive-agi/hive-events {:mvn/version "0.5.14"}}}
+                     io.github.hive-agi/hive-events {:mvn/version "0.5.16"}}}
 
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
