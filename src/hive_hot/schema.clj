@@ -13,11 +13,12 @@
 
 (def component-schema
   "malli value-object for a hot-reload component's opts (the shape reg-hot
-   expects): a required :ns symbol and optional :on-reload / :on-error fns."
+   expects): a required :ns symbol and optional, nil-able :on-reload / :on-error
+   callables (any IFn)."
   [:map
    [:ns :symbol]
-   [:on-reload {:optional true} [:fn fn?]]
-   [:on-error {:optional true} [:fn fn?]]])
+   [:on-reload {:optional true} [:maybe ifn?]]
+   [:on-error {:optional true} [:maybe ifn?]]])
 
 (defn- resolve-compile-op
   "hive-spi.schema.derive/compile-op, or nil when hive-spi is absent
