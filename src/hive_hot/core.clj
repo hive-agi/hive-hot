@@ -671,12 +671,16 @@
    stays tracked while an owner other than the one releasing it still claims
    it. Callers that pass none share one anonymous claim.
 
-   Returns {:dirs [...] :added [...]}."
+   Dirs are compared by canonical path: a root already tracked under another
+   spelling is not added twice.
+
+   Returns hive-hot.schema/ExtendInitReport {:dirs [...] :added [...]}."
   [{:keys [dirs no-reload no-unload owner]}]
   (swap! dir-claims dirs/claim owner (map canonical dirs))
   (let [cfg        (reload-config)
         cur-dirs   (vec (:dirs cfg))
-        added      (vec (remove (set cur-dirs) dirs))
+        added      (dirs/plan-addition (mapv canonical cur-dirs)
+                                         (map (juxt canonical identity) dirs))
         no-reload' (into (set (:no-reload cfg)) no-reload)
         no-unload' (into (set (:no-unload cfg)) no-unload)]
     (if (and (empty? added)

@@ -35,6 +35,22 @@
                 (if (seq left) (assoc m d left) (dissoc m d))))
             (or claims {}) dirs)))
 
+(defn plan-addition
+  "The dirs REQUESTED adds to CURRENT, in the caller's spelling.
+
+   CURRENT    [dir ...] the tracked dirs, canonical
+   REQUESTED  [[canonical spelled] ...] in request order
+
+   A root already tracked, or requested twice, is not added again (first
+   spelling wins); request order is kept. Idempotent: planning REQUESTED
+   against CURRENT plus the answer's canonicals adds nothing."
+  [current requested]
+  (first
+   (reduce (fn [[out seen] [c d]]
+             (if (seen c) [out seen] [(conj out d) (conj seen c)]))
+           [[] (set current)]
+           requested)))
+
 (defn plan-removal
   "What OWNER releasing REQUESTED from CURRENT does, when CORE may never be
    removed and CLAIMS records who else still holds a dir.

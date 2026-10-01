@@ -254,3 +254,40 @@
        ;; removed dirs leave the claim map
        (not-any? #(contains? (:claims p) %) removed)
        (empty? (:removed again))))))
+
+(defspec plan-addition-adds-only-new-roots-once-in-request-order 300
+  (prop/for-all [current   (gen/fmap (comp vec distinct) (gen/vector gen-dir))
+                 requested (gen/vector gen-dir)]
+    (let [pairs (map (juxt identity identity) requested)
+          added (dirs/plan-addition current pairs)]
+      (and (= added (vec (distinct (remove (set current) requested))))
+           (empty? (dirs/plan-addition (into current added) pairs))))))
+
+(defspec claims-then-releases-in-any-order-restore-core-and-empty-claims 200
+  (prop/for-all [core   (gen/fmap (comp vec distinct) (gen/vector gen-dir))
+                 grants (gen/vector (gen/tuple (gen/elements [nil :o1 :o2])
+                                               (gen/vector gen-dir))
+                                    0 6)
+                 seed   gen/nat]
+    (let [step-add (fn [[cur claims] [owner ds]]
+                     [(into cur (dirs/plan-addition cur (map (juxt identity identity) ds)))
+                      (dirs/claim claims owner ds)])
+          [cur claims] (reduce step-add [core {}] grants)
+          releases (->> grants (sort-by (fn [g] (hash [seed g]))))
+          [cur' claims']
+          (reduce (fn [[cur claims] [owner ds]]
+                    (let [p (dirs/plan-removal cur ds (set core) claims owner)]
+                      ;; never drop a dir some other owner still holds
+                      (assert (not-any? (fn [d] (seq (disj (get claims d #{})
+                                                           (dirs/owner-of owner))))
+                                        (:removed p)))
+                      [(:dirs p) (:claims p)]))
+                  [cur claims] releases)]
+      (and (= core cur')
+           (empty? claims')))))
+
+(deftest extend-init-compares-by-canonical-path
+  (hot/init! {:dirs [root-a]})
+  (let [r (hot/extend-init! {:dirs [(str "./" root-a) root-b (str root-b "/")]})]
+    (is (= [root-b] (:added r)))
+    (is (= [root-a root-b] (:dirs r)))))
