@@ -17,7 +17,8 @@
             [clj-reload.core :as reload]
             [clj-reload.parse :as parse]
             [clojure.java.io :as io]
-            [hive-hot.events :as events])
+            [hive-hot.events :as events]
+            [hive-hot.dirs :as dirs])
   (:import [java.io File]))
 
 ;; =============================================================================
@@ -48,6 +49,15 @@
 ;; reload declined would vanish from the next reload's view; this map is what
 ;; keeps a declined change pending for the reload that owns its root.
 (defonce ^:private seen (atom {}))
+
+;; Canonical paths of the dirs the INITIAL init declared (init!, or the
+;; classpath dirs an adopted clj-reload came up with). remove-dirs! never
+;; releases one of these: they are the host's own source, not a plugged-in root.
+(defonce ^:private core-dirs (atom #{}))
+
+;; {canonical-dir #{owner ...}}: who asked for a dir through extend-init!
+;; (see hive-hot.dirs). remove-dirs! only drops a dir no OTHER owner claims.
+(defonce ^:private dir-claims (atom {}))
 
 (defn- clj-var
   "A clj-reload var by name, private or not — find-var skips the compiler's
@@ -100,6 +110,11 @@
 
 (declare init!)
 
+(defn- record-core-dirs!
+  "Remember clj-reload's CURRENT dirs as the core ones remove-dirs! keeps."
+  []
+  (reset! core-dirs (into #{} (map canonical) (:dirs (reload-config)))))
+
 (defn- ensure-initialized!
   "Make a reload possible on a registry nobody initialized. clj-reload
    initializes itself at load with every classpath dir; when that config is
@@ -109,6 +124,7 @@
   (when-not @initialized?
     (if (seq (:dirs (reload-config)))
       (do (reset! seen {})
+          (record-core-dirs!)
           (reset! initialized? true))
       (init!))))
 
@@ -124,8 +140,9 @@
                   pass the JVM start time so edits made before this init are
                   not silently taken as the baseline.
 
-   Resets the per-file baseline. Use `ensure-init!` to extend an initialized
-   registry without resetting it.
+   Resets the per-file baseline. The dirs this call declares are the CORE dirs:
+   `remove-dirs!` never releases them. Use `ensure-init!` to extend an
+   initialized registry without resetting it.
 
    Example:
    ```clojure
@@ -138,6 +155,8 @@
    (when-let [since (:since opts)]
      (swap! (state-atom) assoc :since (long since)))
    (reset! seen {})
+   (reset! dir-claims {})
+   (record-core-dirs!)
    (reset! initialized? true)
    :initialized))
 
@@ -263,6 +282,12 @@
                                         reloads, before live/no-reload filtering.
                                         Untracked namespaces are not covered.
       :mask      #{ns ...}              namespaces pinned :no-reload for the run
+      :withheld  #{ns ...}              work clj-reload holds QUEUED (from an
+                                        earlier, failed or unscoped pass) for
+                                        namespaces outside the roots and the
+                                        cascade — taken out of the pass and
+                                        put back after it
+      :queued    [ns ...]               queued work the pass does run
       :since     long | nil             the :since window the run needs, nil
                                         when there is nothing to load
       :old-since long}"
@@ -297,10 +322,23 @@
         exposed   (when scan-since (filter #(> (mtime %) scan-since) all))
         mask      (into #{}
                         (comp (remove admitted) (mapcat nses-of) (remove closure))
-                        exposed)]
+                        exposed)
+        ;; Work an earlier pass left queued in clj-reload (a failed load is
+        ;; consed back onto :to-unload, the rest of :to-load stays) is replayed
+        ;; by the next pass whoever runs it. Attribute it by file: a queued
+        ;; namespace outside the roots and the cascade is WITHHELD.
+        queued    (distinct (concat (:to-unload state) (:to-load state)))
+        foreign?  (fn [ns]
+                    (let [files (get-in state [:namespaces ns :ns-files])]
+                      (boolean
+                        (and roots* (seq files) (not (closure ns))
+                             (not-any? in-roots? files)))))
+        withheld  (into #{} (filter foreign?) queued)]
     {:roots roots* :want want :dragged dragged :skipped (vec skipped)
      :cascade (vec (sort closure))
-     :mask mask :since window :old-since old-since}))
+     :mask mask :since window :old-since old-since
+     :withheld withheld
+     :queued (vec (remove withheld queued))}))
 
 (defn- run-clj-reload!
   "Drive one clj-reload pass for `plan`: lower :since to the plan's window and
@@ -308,20 +346,35 @@
    admitted files (plus their dependents) and nothing else. Returns clj-reload's
    result map; a scan that throws — a wanted file that will not parse — is
    folded into {:failed sym :exception t} rather than escaping."
-  [{:keys [mask since]} clj-opts]
+  [{:keys [mask since withheld]} clj-opts]
   (let [cfg-var (clj-var 'clj-reload.core/*config*)
-        cfg     (reload-config)]
+        cfg     (reload-config)
+        st      (state-atom)
+        held    (update-vals (select-keys @st [:to-load :to-unload])
+                             #(filterv (set withheld) %))]
     (when since
-      (swap! (state-atom) update :since #(min (or % since) since)))
+      (swap! st update :since #(min (or % since) since)))
+    ;; Withheld queued work sits the pass out and is put back after it — even
+    ;; when the pass throws — so its own root's reload still finds it.
+    (when (seq withheld)
+      (swap! st (fn [s] (-> s
+                            (update :to-load #(vec (remove withheld %)))
+                            (update :to-unload #(vec (remove withheld %)))))))
     (try
-      (with-bindings {cfg-var (update cfg :no-reload (fnil into #{}) mask)}
+      (with-bindings {cfg-var (update cfg :no-reload (fnil into #{}) (concat mask withheld))}
         (reload/reload (merge {:throw false} clj-opts)))
       (catch Throwable t
         {:unloaded [] :loaded []
          :failed (or (:failed (ex-data t))
                      (some-> (:file (ex-data t)) str symbol)
                      'clj-reload.core/scan)
-         :exception t}))))
+         :exception t})
+      (finally
+        (when (seq withheld)
+          (swap! st (fn [s]
+                      (-> s
+                          (update :to-load #(vec (distinct (concat (:to-load held) %))))
+                          (update :to-unload #(vec (distinct (concat (:to-unload held) %))))))))))))
 
 (defn- stale-registrations
   "Handlers still registered from code this pass replaced.
@@ -425,6 +478,14 @@
    work an earlier pass left queued (a namespace unloaded and never loaded, or
    one a caller queued): that work would otherwise wait for an unrelated edit.
 
+   Queued work is attributed by file like a change is. A namespace an earlier
+   pass left queued — typically one that FAILED to compile in an unscoped or
+   another root's reload, which clj-reload replays on every later pass — whose
+   files lie outside the roots and the cascade is WITHHELD: it sits this pass
+   out and goes back in the queue afterwards, so one root's broken work in
+   progress cannot fail every other root's reload, and its own root's reload
+   still finds it.
+
    Returns clj-reload's result plus:
      :success    bool
      :ms         elapsed
@@ -434,6 +495,8 @@
      :dragged    [ns-string ...]  changed outside the roots, loaded as dependents
      :unchanged? true when nothing under the roots had changed
      :pending?   true when the pass ran for queued work alone
+     :withheld   [ns-string ...]  queued work outside the roots, NOT run and
+                                  left queued (present only when non-empty)
      :multi-file {ns [path ...]}  loaded namespaces found in more than one file"
   ([roots] (reload-scoped! roots {}))
   ([roots opts]
@@ -443,7 +506,7 @@
    (let [start    (System/currentTimeMillis)
          state    (reload-state)
          plan     (scope-plan roots)
-         pending? (boolean (or (seq (:to-load state)) (seq (:to-unload state))))
+         pending? (boolean (seq (:queued plan)))
          nses-of  (fn [files]
                     (into [] (comp (mapcat #(file-namespaces state %)) (distinct) (map str))
                           files))
@@ -462,7 +525,8 @@
                     :dragged dragged
                     :unchanged? (nil? (:since plan))
                     :pending? (and pending? (nil? (:since plan))))
-       (seq multi) (assoc :multi-file multi)))))
+       (seq (:withheld plan)) (assoc :withheld (mapv str (sort (:withheld plan))))
+       (seq multi)            (assoc :multi-file multi)))))
 
 (defn reload!
   "Reload changed namespaces and their dependents.
@@ -573,12 +637,14 @@
                                   (:want plan))))))
 
 (defn reset-all!
-  "Reset all registrations and the per-file baseline. Use in tests."
+  "Reset all registrations, the per-file baseline and the core dirs. Use in tests."
   []
   (clojure.core/reset! registry {})
   (clojure.core/reset! listeners {})
   (clojure.core/reset! initialized? false)
   (clojure.core/reset! seen {})
+  (clojure.core/reset! core-dirs #{})
+  (clojure.core/reset! dir-claims {})
   nil)
 
 ;; =============================================================================
@@ -613,6 +679,30 @@
 
 (declare init-with-watcher!)
 
+(defn- reinit-preserving!
+  "Re-init clj-reload over DIRS' (and the given keep sets) WITHOUT resetting the
+   change baseline, the per-file view, or the work a pass left pending: :since,
+   :to-load, :to-unload and every namespace's :keep entries survive."
+  [cfg dirs' no-reload' no-unload']
+  (let [{:keys [since to-load to-unload namespaces]} (reload-state)]
+    (reload/init {:dirs dirs' :no-reload no-reload' :no-unload no-unload'
+                  :files (:files cfg) :reload-hook (:reload-hook cfg)
+                  :unload-hook (:unload-hook cfg) :output (:output cfg)})
+    (swap! (state-atom)
+           (fn [s]
+             (cond-> s
+               since           (assoc :since since)
+               (seq to-load)   (assoc :to-load (vec to-load))
+               (seq to-unload) (assoc :to-unload (vec to-unload))
+               true            (update :namespaces
+                                       (fn [nses]
+                                         (reduce-kv (fn [m ns {:keys [keep]}]
+                                                      (if (and (seq keep) (contains? m ns))
+                                                        (update-in m [ns :keep] #(merge keep %))
+                                                        m))
+                                                    nses namespaces))))))
+    nil))
+
 (defn extend-init!
   "Extend an initialized registry: union `dirs`, `no-reload` and `no-unload`
    into clj-reload's config WITHOUT resetting the change baseline, the
@@ -620,40 +710,71 @@
    this call is still pending after it, a namespace an earlier pass unloaded
    but never loaded is still queued, and a keep entry still stands. No-op when
    nothing is new. Restarts the file watcher, when one is running, over the
-   union.
+   union. The inverse is `remove-dirs!`.
 
-   Returns {:dirs [...] :added [...]}."
-  [{:keys [dirs no-reload no-unload]}]
+   `:owner` (any value, e.g. an addon id) records who claims `dirs`; a dir
+   stays tracked while an owner other than the one releasing it still claims
+   it. Callers that pass none share one anonymous claim.
+
+   Dirs are compared by canonical path: a root already tracked under another
+   spelling is not added twice.
+
+   Returns hive-hot.schema/ExtendInitReport {:dirs [...] :added [...]}."
+  [{:keys [dirs no-reload no-unload owner]}]
+  (swap! dir-claims dirs/claim owner (map canonical dirs))
   (let [cfg        (reload-config)
         cur-dirs   (vec (:dirs cfg))
-        added      (vec (remove (set cur-dirs) dirs))
+        added      (dirs/plan-addition (mapv canonical cur-dirs)
+                                         (map (juxt canonical identity) dirs))
         no-reload' (into (set (:no-reload cfg)) no-reload)
         no-unload' (into (set (:no-unload cfg)) no-unload)]
     (if (and (empty? added)
              (= no-reload' (set (:no-reload cfg)))
              (= no-unload' (set (:no-unload cfg))))
       {:dirs cur-dirs :added []}
-      (let [{:keys [since to-load to-unload namespaces]} (reload-state)
-            dirs' (into cur-dirs added)]
-        (reload/init {:dirs dirs' :no-reload no-reload' :no-unload no-unload'
-                      :files (:files cfg) :reload-hook (:reload-hook cfg)
-                      :unload-hook (:unload-hook cfg) :output (:output cfg)})
-        (swap! (state-atom)
-               (fn [s]
-                 (cond-> s
-                   since           (assoc :since since)
-                   (seq to-load)   (assoc :to-load (vec to-load))
-                   (seq to-unload) (assoc :to-unload (vec to-unload))
-                   true            (update :namespaces
-                                           (fn [nses]
-                                             (reduce-kv (fn [m ns {:keys [keep]}]
-                                                          (if (and (seq keep) (contains? m ns))
-                                                            (update-in m [ns :keep] #(merge keep %))
-                                                            m))
-                                                        nses namespaces))))))
+      (let [dirs' (into cur-dirs added)]
+        (reinit-preserving! cfg dirs' no-reload' no-unload')
         (when-let [opts (:opts @watcher-state)]
           (init-with-watcher! (assoc opts :dirs dirs')))
         {:dirs dirs' :added added}))))
+
+(defn remove-dirs!
+  "Stop tracking and watching `dirs` — the inverse of `extend-init!`, for a
+   source root being plugged OUT. Drops them from clj-reload's :dirs WITHOUT
+   resetting the change baseline, the per-file view or pending work, and
+   restarts a running file watcher without them.
+
+   A dir the INITIAL init declared (see `init!`; an uninitialized registry first
+   adopts clj-reload's dirs as that initial set) is never removed: it is the
+   host's own source, and is answered under :kept. A dir another owner still
+   claims (see `extend-init!` :owner) is released for `:owner` only, stays
+   tracked, and is answered under :kept and :shared. A dir that is not tracked
+   is answered under :absent. Dirs are compared by canonical path and answered
+   in the caller's spelling. Idempotent: a second call removes nothing.
+
+   Returns hive-hot.schema/RemoveDirsReport:
+     {:removed [...] :kept [...] :absent [...] :dirs [...] :shared {dir [owner]}}
+   :dirs are the tracked dirs after the call."
+  [{:keys [dirs owner]}]
+  (ensure-initialized!)
+  (let [cfg      (reload-config)
+        cur-dirs (vec (:dirs cfg))
+        spelled  (into {} (map (juxt canonical identity)) (reverse dirs))
+        plan     (dirs/plan-removal (mapv canonical cur-dirs) (mapv canonical dirs)
+                                    @core-dirs @dir-claims owner)
+        gone     (set (:removed plan))
+        dirs'    (into [] (remove #(gone (canonical %))) cur-dirs)
+        caller   (fn [ks] (mapv spelled ks))]
+    (reset! dir-claims (:claims plan))
+    (when (seq gone)
+      (reinit-preserving! cfg dirs' (:no-reload cfg) (:no-unload cfg))
+      (when-let [opts (:opts @watcher-state)]
+        (init-with-watcher! (update opts :dirs #(into [] (remove (fn [d] (gone (canonical d)))) %)))))
+    {:removed (caller (:removed plan))
+     :kept    (caller (:kept plan))
+     :absent  (caller (:absent plan))
+     :dirs    dirs'
+     :shared  (into {} (map (fn [[d os]] [(spelled d) os])) (:shared plan))}))
 
 (defn ensure-init!
   "`init!` when not yet initialized, else `extend-init!` — the idempotent way

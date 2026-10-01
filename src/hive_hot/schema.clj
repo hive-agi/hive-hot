@@ -20,6 +20,35 @@
    [:on-reload {:optional true} [:maybe ifn?]]
    [:on-error {:optional true} [:maybe ifn?]]])
 
+(def Dir
+  "A source root as a caller spelled it."
+  :string)
+
+(def ExtendInitReport
+  "What hive-hot.core/extend-init! answers: the tracked dirs after the call and
+   the ones it newly added, in the caller's spelling."
+  [:map {:closed true}
+   [:dirs [:vector Dir]]
+   [:added [:vector Dir]]])
+
+(def RemoveDirsReport
+  "What hive-hot.core/remove-dirs! answers — the contract a plug-out (e.g.
+   hive-addon's eject!) reads. Every requested dir is in exactly one of
+   :removed :kept :absent, in the caller's spelling.
+
+   :removed  no longer tracked nor watched
+   :kept     still tracked: a core dir (the initial init declared it), or one
+             another owner still claims (then also in :shared)
+   :absent   was not tracked; nothing done
+   :dirs     every tracked dir after the call
+   :shared   {kept-dir [other-owner ...]} for the kept dirs another owner holds"
+  [:map {:closed true}
+   [:removed [:vector Dir]]
+   [:kept [:vector Dir]]
+   [:absent [:vector Dir]]
+   [:dirs [:vector Dir]]
+   [:shared [:map-of Dir [:vector :any]]]])
+
 (defn- resolve-compile-op
   "hive-spi.schema.derive/compile-op, or nil when hive-spi is absent
    (requiring-resolve THROWS on an absent ns, so it is guarded)."
