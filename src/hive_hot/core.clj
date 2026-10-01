@@ -277,6 +277,12 @@
                                         reloads, before live/no-reload filtering.
                                         Untracked namespaces are not covered.
       :mask      #{ns ...}              namespaces pinned :no-reload for the run
+      :withheld  #{ns ...}              work clj-reload holds QUEUED (from an
+                                        earlier, failed or unscoped pass) for
+                                        namespaces outside the roots and the
+                                        cascade — taken out of the pass and
+                                        put back after it
+      :queued    [ns ...]               queued work the pass does run
       :since     long | nil             the :since window the run needs, nil
                                         when there is nothing to load
       :old-since long}"
@@ -311,10 +317,23 @@
         exposed   (when scan-since (filter #(> (mtime %) scan-since) all))
         mask      (into #{}
                         (comp (remove admitted) (mapcat nses-of) (remove closure))
-                        exposed)]
+                        exposed)
+        ;; Work an earlier pass left queued in clj-reload (a failed load is
+        ;; consed back onto :to-unload, the rest of :to-load stays) is replayed
+        ;; by the next pass whoever runs it. Attribute it by file: a queued
+        ;; namespace outside the roots and the cascade is WITHHELD.
+        queued    (distinct (concat (:to-unload state) (:to-load state)))
+        foreign?  (fn [ns]
+                    (let [files (get-in state [:namespaces ns :ns-files])]
+                      (boolean
+                        (and roots* (seq files) (not (closure ns))
+                             (not-any? in-roots? files)))))
+        withheld  (into #{} (filter foreign?) queued)]
     {:roots roots* :want want :dragged dragged :skipped (vec skipped)
      :cascade (vec (sort closure))
-     :mask mask :since window :old-since old-since}))
+     :mask mask :since window :old-since old-since
+     :withheld withheld
+     :queued (vec (remove withheld queued))}))
 
 (defn- run-clj-reload!
   "Drive one clj-reload pass for `plan`: lower :since to the plan's window and
@@ -322,20 +341,35 @@
    admitted files (plus their dependents) and nothing else. Returns clj-reload's
    result map; a scan that throws — a wanted file that will not parse — is
    folded into {:failed sym :exception t} rather than escaping."
-  [{:keys [mask since]} clj-opts]
+  [{:keys [mask since withheld]} clj-opts]
   (let [cfg-var (clj-var 'clj-reload.core/*config*)
-        cfg     (reload-config)]
+        cfg     (reload-config)
+        st      (state-atom)
+        held    (update-vals (select-keys @st [:to-load :to-unload])
+                             #(filterv (set withheld) %))]
     (when since
-      (swap! (state-atom) update :since #(min (or % since) since)))
+      (swap! st update :since #(min (or % since) since)))
+    ;; Withheld queued work sits the pass out and is put back after it — even
+    ;; when the pass throws — so its own root's reload still finds it.
+    (when (seq withheld)
+      (swap! st (fn [s] (-> s
+                            (update :to-load #(vec (remove withheld %)))
+                            (update :to-unload #(vec (remove withheld %)))))))
     (try
-      (with-bindings {cfg-var (update cfg :no-reload (fnil into #{}) mask)}
+      (with-bindings {cfg-var (update cfg :no-reload (fnil into #{}) (concat mask withheld))}
         (reload/reload (merge {:throw false} clj-opts)))
       (catch Throwable t
         {:unloaded [] :loaded []
          :failed (or (:failed (ex-data t))
                      (some-> (:file (ex-data t)) str symbol)
                      'clj-reload.core/scan)
-         :exception t}))))
+         :exception t})
+      (finally
+        (when (seq withheld)
+          (swap! st (fn [s]
+                      (-> s
+                          (update :to-load #(vec (distinct (concat (:to-load held) %))))
+                          (update :to-unload #(vec (distinct (concat (:to-unload held) %))))))))))))
 
 (defn- stale-registrations
   "Handlers still registered from code this pass replaced.
@@ -439,6 +473,14 @@
    work an earlier pass left queued (a namespace unloaded and never loaded, or
    one a caller queued): that work would otherwise wait for an unrelated edit.
 
+   Queued work is attributed by file like a change is. A namespace an earlier
+   pass left queued — typically one that FAILED to compile in an unscoped or
+   another root's reload, which clj-reload replays on every later pass — whose
+   files lie outside the roots and the cascade is WITHHELD: it sits this pass
+   out and goes back in the queue afterwards, so one root's broken work in
+   progress cannot fail every other root's reload, and its own root's reload
+   still finds it.
+
    Returns clj-reload's result plus:
      :success    bool
      :ms         elapsed
@@ -448,6 +490,8 @@
      :dragged    [ns-string ...]  changed outside the roots, loaded as dependents
      :unchanged? true when nothing under the roots had changed
      :pending?   true when the pass ran for queued work alone
+     :withheld   [ns-string ...]  queued work outside the roots, NOT run and
+                                  left queued (present only when non-empty)
      :multi-file {ns [path ...]}  loaded namespaces found in more than one file"
   ([roots] (reload-scoped! roots {}))
   ([roots opts]
@@ -457,7 +501,7 @@
    (let [start    (System/currentTimeMillis)
          state    (reload-state)
          plan     (scope-plan roots)
-         pending? (boolean (or (seq (:to-load state)) (seq (:to-unload state))))
+         pending? (boolean (seq (:queued plan)))
          nses-of  (fn [files]
                     (into [] (comp (mapcat #(file-namespaces state %)) (distinct) (map str))
                           files))
@@ -476,7 +520,8 @@
                     :dragged dragged
                     :unchanged? (nil? (:since plan))
                     :pending? (and pending? (nil? (:since plan))))
-       (seq multi) (assoc :multi-file multi)))))
+       (seq (:withheld plan)) (assoc :withheld (mapv str (sort (:withheld plan))))
+       (seq multi)            (assoc :multi-file multi)))))
 
 (defn reload!
   "Reload changed namespaces and their dependents.
