@@ -17,7 +17,8 @@
             [clj-reload.core :as reload]
             [clj-reload.parse :as parse]
             [clojure.java.io :as io]
-            [hive-hot.events :as events])
+            [hive-hot.events :as events]
+            [hive-hot.dirs :as dirs])
   (:import [java.io File]))
 
 ;; =============================================================================
@@ -48,6 +49,11 @@
 ;; reload declined would vanish from the next reload's view; this map is what
 ;; keeps a declined change pending for the reload that owns its root.
 (defonce ^:private seen (atom {}))
+
+;; Canonical paths of the dirs the INITIAL init declared (init!, or the
+;; classpath dirs an adopted clj-reload came up with). remove-dirs! never
+;; releases one of these: they are the host's own source, not a plugged-in root.
+(defonce ^:private core-dirs (atom #{}))
 
 (defn- clj-var
   "A clj-reload var by name, private or not — find-var skips the compiler's
@@ -100,6 +106,11 @@
 
 (declare init!)
 
+(defn- record-core-dirs!
+  "Remember clj-reload's CURRENT dirs as the core ones remove-dirs! keeps."
+  []
+  (reset! core-dirs (into #{} (map canonical) (:dirs (reload-config)))))
+
 (defn- ensure-initialized!
   "Make a reload possible on a registry nobody initialized. clj-reload
    initializes itself at load with every classpath dir; when that config is
@@ -109,6 +120,7 @@
   (when-not @initialized?
     (if (seq (:dirs (reload-config)))
       (do (reset! seen {})
+          (record-core-dirs!)
           (reset! initialized? true))
       (init!))))
 
@@ -124,8 +136,9 @@
                   pass the JVM start time so edits made before this init are
                   not silently taken as the baseline.
 
-   Resets the per-file baseline. Use `ensure-init!` to extend an initialized
-   registry without resetting it.
+   Resets the per-file baseline. The dirs this call declares are the CORE dirs:
+   `remove-dirs!` never releases them. Use `ensure-init!` to extend an
+   initialized registry without resetting it.
 
    Example:
    ```clojure
@@ -138,6 +151,7 @@
    (when-let [since (:since opts)]
      (swap! (state-atom) assoc :since (long since)))
    (reset! seen {})
+   (record-core-dirs!)
    (reset! initialized? true)
    :initialized))
 
@@ -573,12 +587,13 @@
                                   (:want plan))))))
 
 (defn reset-all!
-  "Reset all registrations and the per-file baseline. Use in tests."
+  "Reset all registrations, the per-file baseline and the core dirs. Use in tests."
   []
   (clojure.core/reset! registry {})
   (clojure.core/reset! listeners {})
   (clojure.core/reset! initialized? false)
   (clojure.core/reset! seen {})
+  (clojure.core/reset! core-dirs #{})
   nil)
 
 ;; =============================================================================
@@ -613,6 +628,30 @@
 
 (declare init-with-watcher!)
 
+(defn- reinit-preserving!
+  "Re-init clj-reload over DIRS' (and the given keep sets) WITHOUT resetting the
+   change baseline, the per-file view, or the work a pass left pending: :since,
+   :to-load, :to-unload and every namespace's :keep entries survive."
+  [cfg dirs' no-reload' no-unload']
+  (let [{:keys [since to-load to-unload namespaces]} (reload-state)]
+    (reload/init {:dirs dirs' :no-reload no-reload' :no-unload no-unload'
+                  :files (:files cfg) :reload-hook (:reload-hook cfg)
+                  :unload-hook (:unload-hook cfg) :output (:output cfg)})
+    (swap! (state-atom)
+           (fn [s]
+             (cond-> s
+               since           (assoc :since since)
+               (seq to-load)   (assoc :to-load (vec to-load))
+               (seq to-unload) (assoc :to-unload (vec to-unload))
+               true            (update :namespaces
+                                       (fn [nses]
+                                         (reduce-kv (fn [m ns {:keys [keep]}]
+                                                      (if (and (seq keep) (contains? m ns))
+                                                        (update-in m [ns :keep] #(merge keep %))
+                                                        m))
+                                                    nses namespaces))))))
+    nil))
+
 (defn extend-init!
   "Extend an initialized registry: union `dirs`, `no-reload` and `no-unload`
    into clj-reload's config WITHOUT resetting the change baseline, the
@@ -620,7 +659,7 @@
    this call is still pending after it, a namespace an earlier pass unloaded
    but never loaded is still queued, and a keep entry still stands. No-op when
    nothing is new. Restarts the file watcher, when one is running, over the
-   union.
+   union. The inverse is `remove-dirs!`.
 
    Returns {:dirs [...] :added [...]}."
   [{:keys [dirs no-reload no-unload]}]
@@ -633,27 +672,43 @@
              (= no-reload' (set (:no-reload cfg)))
              (= no-unload' (set (:no-unload cfg))))
       {:dirs cur-dirs :added []}
-      (let [{:keys [since to-load to-unload namespaces]} (reload-state)
-            dirs' (into cur-dirs added)]
-        (reload/init {:dirs dirs' :no-reload no-reload' :no-unload no-unload'
-                      :files (:files cfg) :reload-hook (:reload-hook cfg)
-                      :unload-hook (:unload-hook cfg) :output (:output cfg)})
-        (swap! (state-atom)
-               (fn [s]
-                 (cond-> s
-                   since           (assoc :since since)
-                   (seq to-load)   (assoc :to-load (vec to-load))
-                   (seq to-unload) (assoc :to-unload (vec to-unload))
-                   true            (update :namespaces
-                                           (fn [nses]
-                                             (reduce-kv (fn [m ns {:keys [keep]}]
-                                                          (if (and (seq keep) (contains? m ns))
-                                                            (update-in m [ns :keep] #(merge keep %))
-                                                            m))
-                                                        nses namespaces))))))
+      (let [dirs' (into cur-dirs added)]
+        (reinit-preserving! cfg dirs' no-reload' no-unload')
         (when-let [opts (:opts @watcher-state)]
           (init-with-watcher! (assoc opts :dirs dirs')))
         {:dirs dirs' :added added}))))
+
+(defn remove-dirs!
+  "Stop tracking and watching `dirs` — the inverse of `extend-init!`, for a
+   source root being plugged OUT. Drops them from clj-reload's :dirs WITHOUT
+   resetting the change baseline, the per-file view or pending work, and
+   restarts a running file watcher without them.
+
+   A dir the INITIAL init declared (see `init!`; an uninitialized registry first
+   adopts clj-reload's dirs as that initial set) is never removed: it is the
+   host's own source, and is answered under :kept. A dir that is not tracked is
+   answered under :absent. Dirs are compared by canonical path and answered in
+   the caller's spelling. Idempotent: a second call removes nothing.
+
+   Returns {:removed [...] :kept [...] :absent [...] :dirs [...]}, where :dirs
+   are the tracked dirs after the call."
+  [{:keys [dirs]}]
+  (ensure-initialized!)
+  (let [cfg      (reload-config)
+        cur-dirs (vec (:dirs cfg))
+        spelled  (into {} (map (juxt canonical identity)) dirs)
+        plan     (dirs/plan-removal (mapv canonical cur-dirs) (mapv canonical dirs) @core-dirs)
+        gone     (set (:removed plan))
+        dirs'    (into [] (remove #(gone (canonical %))) cur-dirs)
+        caller   (fn [ks] (mapv spelled ks))]
+    (when (seq gone)
+      (reinit-preserving! cfg dirs' (:no-reload cfg) (:no-unload cfg))
+      (when-let [opts (:opts @watcher-state)]
+        (init-with-watcher! (update opts :dirs #(into [] (remove (fn [d] (gone (canonical d)))) %)))))
+    {:removed (caller (:removed plan))
+     :kept    (caller (:kept plan))
+     :absent  (caller (:absent plan))
+     :dirs    dirs'}))
 
 (defn ensure-init!
   "`init!` when not yet initialized, else `extend-init!` — the idempotent way
