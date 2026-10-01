@@ -55,6 +55,10 @@
 ;; releases one of these: they are the host's own source, not a plugged-in root.
 (defonce ^:private core-dirs (atom #{}))
 
+;; {canonical-dir #{owner ...}}: who asked for a dir through extend-init!
+;; (see hive-hot.dirs). remove-dirs! only drops a dir no OTHER owner claims.
+(defonce ^:private dir-claims (atom {}))
+
 (defn- clj-var
   "A clj-reload var by name, private or not — find-var skips the compiler's
    privacy check. hive-hot pins clj-reload 1.0.0; throws when an internal moved."
@@ -151,6 +155,7 @@
    (when-let [since (:since opts)]
      (swap! (state-atom) assoc :since (long since)))
    (reset! seen {})
+   (reset! dir-claims {})
    (record-core-dirs!)
    (reset! initialized? true)
    :initialized))
@@ -594,6 +599,7 @@
   (clojure.core/reset! initialized? false)
   (clojure.core/reset! seen {})
   (clojure.core/reset! core-dirs #{})
+  (clojure.core/reset! dir-claims {})
   nil)
 
 ;; =============================================================================
@@ -661,8 +667,13 @@
    nothing is new. Restarts the file watcher, when one is running, over the
    union. The inverse is `remove-dirs!`.
 
+   `:owner` (any value, e.g. an addon id) records who claims `dirs`; a dir
+   stays tracked while an owner other than the one releasing it still claims
+   it. Callers that pass none share one anonymous claim.
+
    Returns {:dirs [...] :added [...]}."
-  [{:keys [dirs no-reload no-unload]}]
+  [{:keys [dirs no-reload no-unload owner]}]
+  (swap! dir-claims dirs/claim owner (map canonical dirs))
   (let [cfg        (reload-config)
         cur-dirs   (vec (:dirs cfg))
         added      (vec (remove (set cur-dirs) dirs))
@@ -686,21 +697,26 @@
 
    A dir the INITIAL init declared (see `init!`; an uninitialized registry first
    adopts clj-reload's dirs as that initial set) is never removed: it is the
-   host's own source, and is answered under :kept. A dir that is not tracked is
-   answered under :absent. Dirs are compared by canonical path and answered in
-   the caller's spelling. Idempotent: a second call removes nothing.
+   host's own source, and is answered under :kept. A dir another owner still
+   claims (see `extend-init!` :owner) is released for `:owner` only, stays
+   tracked, and is answered under :kept and :shared. A dir that is not tracked
+   is answered under :absent. Dirs are compared by canonical path and answered
+   in the caller's spelling. Idempotent: a second call removes nothing.
 
-   Returns {:removed [...] :kept [...] :absent [...] :dirs [...]}, where :dirs
-   are the tracked dirs after the call."
-  [{:keys [dirs]}]
+   Returns hive-hot.schema/RemoveDirsReport:
+     {:removed [...] :kept [...] :absent [...] :dirs [...] :shared {dir [owner]}}
+   :dirs are the tracked dirs after the call."
+  [{:keys [dirs owner]}]
   (ensure-initialized!)
   (let [cfg      (reload-config)
         cur-dirs (vec (:dirs cfg))
-        spelled  (into {} (map (juxt canonical identity)) dirs)
-        plan     (dirs/plan-removal (mapv canonical cur-dirs) (mapv canonical dirs) @core-dirs)
+        spelled  (into {} (map (juxt canonical identity)) (reverse dirs))
+        plan     (dirs/plan-removal (mapv canonical cur-dirs) (mapv canonical dirs)
+                                    @core-dirs @dir-claims owner)
         gone     (set (:removed plan))
         dirs'    (into [] (remove #(gone (canonical %))) cur-dirs)
         caller   (fn [ks] (mapv spelled ks))]
+    (reset! dir-claims (:claims plan))
     (when (seq gone)
       (reinit-preserving! cfg dirs' (:no-reload cfg) (:no-unload cfg))
       (when-let [opts (:opts @watcher-state)]
@@ -708,7 +724,8 @@
     {:removed (caller (:removed plan))
      :kept    (caller (:kept plan))
      :absent  (caller (:absent plan))
-     :dirs    dirs'}))
+     :dirs    dirs'
+     :shared  (into {} (map (fn [[d os]] [(spelled d) os])) (:shared plan))}))
 
 (defn ensure-init!
   "`init!` when not yet initialized, else `extend-init!` — the idempotent way
