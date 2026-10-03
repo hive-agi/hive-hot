@@ -340,6 +340,64 @@
      :withheld withheld
      :queued (vec (remove withheld queued))}))
 
+(defn- live-ns?
+  "Whether `ns-obj` is still the Namespace object the image resolves its name to."
+  [ns-obj]
+  (identical? ns-obj (find-ns (ns-name ns-obj))))
+
+(defn- unalias-stale!
+  "Drop every alias, in every live namespace, whose target Namespace object is
+   no longer the one the image resolves that name to - typically one the pass
+   just removed. A namespace that keeps such an alias fails its next ns form
+   with 'Alias x already exists'. Returns the dropped aliases as
+   [{:holder ns :alias sym :target sym} ...]."
+  []
+  (vec (for [holder (all-ns)
+             [a target] (ns-aliases holder)
+             :when (not (live-ns? target))]
+         (do (ns-unalias holder a)
+             {:holder (ns-name holder) :alias a :target (ns-name target)}))))
+
+(defn- realias!
+  "After the load half of a pass: put back each alias `unalias-stale!` dropped.
+   A holder whose own load re-created it is reported :reloaded; one the pass
+   did not load is pointed at the live target and reported :realiased; when no
+   namespace by that name exists any more the alias stays dropped, :unaliased."
+  [dropped]
+  (mapv (fn [{:keys [holder alias target]}]
+          (let [h       (find-ns holder)
+                current (some-> h ns-aliases (get alias))
+                live    (find-ns target)
+                action  (cond
+                          (nil? h)                          :unaliased
+                          (and current (live-ns? current))  :reloaded
+                          live                              (do (.addAlias ^clojure.lang.Namespace h alias live)
+                                                                :realiased)
+                          :else                             :unaliased)]
+            {:holder (str holder) :alias (str alias) :target (str target)
+             :action action}))
+        dropped))
+
+(defn- clj-reload-pass!
+  "One clj-reload pass with the alias trap disarmed: unload, drop every alias
+   to a namespace object that is no longer live, load, then re-point what the
+   load did not re-create. Holds clj-reload's lock across both halves. The
+   result carries :aliases-repaired when any alias was touched."
+  [opts]
+  (.lock ^java.util.concurrent.locks.ReentrantLock reload/lock)
+  (try
+    (let [{:keys [unloaded]} (reload/unload opts)
+          dropped            (unalias-stale!)
+          result             (try
+                               (reload/reload (dissoc opts :only))
+                               (catch Throwable t
+                                 (realias! dropped)
+                                 (throw t)))]
+      (cond-> (update result :unloaded #(into (vec unloaded) %))
+        (seq dropped) (assoc :aliases-repaired (realias! dropped))))
+    (finally
+      (.unlock ^java.util.concurrent.locks.ReentrantLock reload/lock))))
+
 (defn- run-clj-reload!
   "Drive one clj-reload pass for `plan`: lower :since to the plan's window and
    pin the plan's :mask as :no-reload for the duration, so the pass loads the
@@ -362,7 +420,7 @@
                             (update :to-unload #(vec (remove withheld %)))))))
     (try
       (with-bindings {cfg-var (update cfg :no-reload (fnil into #{}) (concat mask withheld))}
-        (reload/reload (merge {:throw false} clj-opts)))
+        (clj-reload-pass! (merge {:throw false} clj-opts)))
       (catch Throwable t
         {:unloaded [] :loaded []
          :failed (or (:failed (ex-data t))
@@ -442,7 +500,8 @@
    The result also carries :stale-registrations when the pass left a registry
    entry pointing at code it just replaced. That is the one failure this report
    could not otherwise show: loading succeeds, the namespace is listed, and the
-   old closure keeps running."
+   old closure keeps running. On failure it carries :root-cause, the innermost
+   ex-cause, and :error names it after the wrapper message."
   [result start]
   (let [elapsed  (- (System/currentTimeMillis) start)
         success? (nil? (:failed result))
@@ -460,7 +519,7 @@
           (events/emit-reload-error! (:failed result) (:exception result))))
     (diagnostic/reload-outcome
       (cond-> (merge result {:success success? :ms elapsed})
-      (:exception result) (assoc :error (ex-message (:exception result)))
+      (:exception result) (diagnostic/with-root-cause)
       stale               (assoc :stale-registrations stale)))))
 
 (defn reload-scoped!
@@ -549,8 +608,14 @@
     :unloaded [ns ...]
     :loaded [ns ...]
     :failed ns-or-nil
-    :error message-or-nil
+    :error message-or-nil -- the wrapper message followed by the root cause
+    :root-cause {:message :class :ns :file :line :column} -- the innermost
+      ex-cause of the failure (present only on failure)
     :exception throwable-or-nil
+    :aliases-repaired [{:holder ns :alias sym :target ns
+                        :action :reloaded|:realiased|:unaliased} ...] --
+      present only when a namespace held an alias to a Namespace object the
+      pass replaced (see `clj-reload-pass!`)
     :stale-registrations [{:registry :fx :id k :owner ns/name} ...] -- present
       only when the pass left a hive-events registry entry holding a function
       from code it just replaced, which happens when the registration is
@@ -573,7 +638,7 @@
        (events/emit-reload-start!)
        (let [start     (System/currentTimeMillis)
              old-since (:since (reload-state) 0)
-             result    (reload/reload (merge {:throw false} opts))]
+             result    (clj-reload-pass! (merge {:throw false} opts))]
          (record-loaded! old-since (:loaded result))
          (finish! result start))))))
 
