@@ -1,0 +1,10 @@
+{:absent {:dirs ["/core"], :removed [], :kept [], :absent ["/y"]},
+ :core-kept
+ {:dirs ["/core" "/x"], :removed [], :kept ["/core"], :absent []},
+ :extended {:dirs ["/core"], :removed ["/x"], :kept [], :absent []},
+ :mixed-dups
+ {:dirs ["/core" "/x"],
+  :removed ["/y"],
+  :kept ["/core"],
+  :absent ["/z"]},
+ :nothing {:dirs ["/core"], :removed [], :kept [], :absent []}}
