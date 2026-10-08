@@ -1,0 +1,6 @@
+{:both-roots ["test/fixtures/integration" "test/fixtures/scoped"],
+ :empty [],
+ :one-root ["test/fixtures/integration"],
+ :outside [],
+ :prefix-not-parent [],
+ :same-root-twice ["test/fixtures/integration"]}
