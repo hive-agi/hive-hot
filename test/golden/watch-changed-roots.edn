@@ -1,10 +1,6 @@
-{:both-roots
- ["/home/klein/PP/hive-wt/t300-hot-watch-scope/test/fixtures/integration"
-  "/home/klein/PP/hive-wt/t300-hot-watch-scope/test/fixtures/scoped"],
+{:both-roots ["test/fixtures/integration" "test/fixtures/scoped"],
  :empty [],
- :one-root
- ["/home/klein/PP/hive-wt/t300-hot-watch-scope/test/fixtures/integration"],
+ :one-root ["test/fixtures/integration"],
  :outside [],
  :prefix-not-parent [],
- :same-root-twice
- ["/home/klein/PP/hive-wt/t300-hot-watch-scope/test/fixtures/integration"]}
+ :same-root-twice ["test/fixtures/integration"]}
