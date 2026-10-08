@@ -852,6 +852,22 @@
         {:initialized? true :fresh? true
          :dirs (vec (:dirs (reload-config))) :added (vec (:dirs opts))})))
 
+(defn changed-roots
+  "The watched `dirs` that contain at least one of the changed `files`, as
+   sorted canonical paths, each once.
+
+   The watcher's debounced reload passes these to `reload-scoped!`, so a save
+   under one repo reloads that repo (plus the namespaces that depend on it)
+   and leaves a co-tenant's half-saved file under another watched dir pending
+   for the reload that owns it. A file under no watched dir contributes no
+   root."
+  [dirs files]
+  (let [roots (mapv canonical dirs)
+        paths (mapv canonical files)]
+    (into [] (comp (filter (fn [root] (some #(under-root? root %) paths)))
+                   (distinct))
+          (sort roots))))
+
 (defn init-with-watcher!
   "Initialize hive-hot with file watcher and coordinating debouncer.
 
@@ -931,7 +947,7 @@
                         (doseq [file files]
                           (events/emit-file-changed! (str file) :modify))
                         ;; Trigger reload
-                        (reload!))
+                        (reload-scoped! (changed-roots dirs files)))
                       claim-checker
                       :cooldown-ms debounce-ms)
            ;; Create watcher
