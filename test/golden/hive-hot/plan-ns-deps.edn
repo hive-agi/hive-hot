@@ -1,0 +1,6 @@
+{:bad-name nil,
+ :import {:ns a.b, :requires #{}},
+ :no-deps {:ns a.b, :requires #{}},
+ :not-form nil,
+ :not-ns nil,
+ :plain {:ns a.b, :requires #{p.q pre.two x.y u pre.fix}}}

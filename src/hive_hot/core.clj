@@ -18,7 +18,8 @@
             [clj-reload.parse :as parse]
             [clojure.java.io :as io]
             [hive-hot.events :as events]
-            [hive-hot.dirs :as dirs])
+            [hive-hot.dirs :as dirs]
+            [hive-hot.plan :as plan])
   (:import [java.io File]))
 
 ;; =============================================================================
@@ -307,8 +308,8 @@
         want      (vec want)
         nses-of   (fn [f] (or (file-namespaces state f) #{}))
         want-nses (into #{} (mapcat nses-of) want)
-        deps      (parse/dependees (:namespaces state))
-        closure   (set (parse/transitive-closure deps (vec want-nses)))
+        deps      (plan/dependees (plan/graph->sources (:namespaces state)))
+        closure   (plan/dependents-closure deps want-nses)
         {dragged true skipped false} (group-by (fn [f] (boolean (some closure (nses-of f))))
                                                outside)
         dragged   (vec dragged)

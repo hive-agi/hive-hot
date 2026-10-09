@@ -1,0 +1,21 @@
+{:chain
+ {:order
+  [{:ns a, :requires #{}}
+   {:ns b, :requires #{a}}
+   {:ns c, :requires #{b}}],
+  :cycle []},
+ :cycle
+ {:order [{:ns d, :requires #{}}],
+  :cycle
+  [{:ns a, :requires #{b}}
+   {:ns b, :requires #{a}}
+   {:ns c, :requires #{a}}]},
+ :empty {:order [], :cycle []},
+ :external {:order [{:ns a, :requires #{clojure.string}}], :cycle []},
+ :self {:order [{:ns a, :requires #{a}}], :cycle []},
+ :ties
+ {:order
+  [{:ns z, :requires #{}}
+   {:ns y, :requires #{}}
+   {:ns x, :requires #{y}}],
+  :cycle []}}
