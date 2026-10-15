@@ -53,3 +53,21 @@
       (is (= [(.getPath root)] (hot/watching-paths)))
       (is (= [(.getPath root)] (:dirs (hot/status))))
       (finally (delete-tree! root)))))
+
+(deftest a-discovered-library-root-is-registered-for-watching-and-reload
+  (let [root (temporary-root)
+        src (io/file root "src")]
+    (try
+      (.mkdir src)
+      (let [basis {:libs {'fixture/lib {:local/root (.getPath root) :paths ["src"]}}}
+            dir (first (hot/local-root-source-dirs basis))]
+        ;; Exercise the same discovered paths passed into init-with-watcher! without
+        ;; changing the process-wide tools.deps basis used by other tests.
+        (hot/init-with-watcher! {:dirs [dir] :watch-local-roots? false})
+        (is (= [dir] (hot/watching-paths)))
+        (is (some #{dir} (:dirs (hot/status))))
+        (let [result (hot/reload-scoped! [dir])]
+          (is (:success result) (pr-str result))))
+      (finally
+        (hot/stop-watcher!)
+        (delete-tree! root)))))
