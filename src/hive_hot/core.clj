@@ -868,6 +868,31 @@
                    (distinct))
           (sort roots))))
 
+(defn local-root-source-dirs
+  "Existing source directories of :local/root libraries in a tools.deps basis.
+   Library :paths are relative to their own root, never to the host cwd.
+   The classpath roots in a basis may also contain jars and unrelated host
+   paths, so only explicit local-root library entries are selected."
+  [basis]
+  (into []
+        (comp (mapcat (fn [[_ {:keys [local/root paths]}]]
+                        (when root
+                          (for [path paths]
+                            (io/file root path)))))
+              (filter #(.isDirectory ^File %))
+              (map canonical)
+              (distinct))
+        (:libs basis)))
+
+(defn- current-local-root-dirs
+  "Read the host's tools.deps basis when available. A deployed jar may not
+   include clojure.java.basis; in that case explicit :dirs still work."
+  []
+  (if-let [current-basis (try (requiring-resolve 'clojure.java.basis/current-basis)
+                              (catch java.io.FileNotFoundException _ nil))]
+    (local-root-source-dirs (current-basis))
+    []))
+
 (defn init-with-watcher!
   "Initialize hive-hot with file watcher and coordinating debouncer.
 
@@ -883,6 +908,8 @@
    - :debounce-ms   - Debounce window in ms (default: 100)
    - :no-reload     - Namespaces to never reload
    - :no-unload     - Namespaces to reload but not unload
+   - :watch-local-roots? - Include existing source dirs of tools.deps
+                          :local/root libraries (default: true)
 
    clj-reload is initialized through `ensure-init!`: an already-initialized
    registry is EXTENDED with the dirs, never reset, so a change made between
@@ -913,64 +940,67 @@
 
    Returns :watching on success."
   ([] (init-with-watcher! {}))
-  ([{:keys [dirs claim-checker debounce-ms no-reload no-unload]
+  ([{:keys [dirs claim-checker debounce-ms no-reload no-unload watch-local-roots?]
      :or {dirs ["src"]
           claim-checker (constantly #{})
-          debounce-ms 100}
+          debounce-ms 100
+          watch-local-roots? true}
      :as opts}]
-   ;; Initialize clj-reload — extending, never resetting, an initialized registry
-   (ensure-init! (cond-> {:dirs dirs}
-                   no-reload (assoc :no-reload no-reload)
-                   no-unload (assoc :no-unload no-unload)))
+   (let [dirs (into (vec dirs) (remove (set (map canonical dirs)))
+                    (if watch-local-roots? (current-local-root-dirs) []))]
+     ;; Initialize clj-reload — extending, never resetting, an initialized registry
+     (ensure-init! (cond-> {:dirs dirs}
+                     no-reload (assoc :no-reload no-reload)
+                     no-unload (assoc :no-unload no-unload)))
 
-   ;; Require watcher and debouncer namespaces dynamically
-   (require 'hive-hot.watcher)
-   (require 'hive-hot.debounce)
+     ;; Require watcher and debouncer namespaces dynamically
+     (require 'hive-hot.watcher)
+     (require 'hive-hot.debounce)
 
-   (let [create-watcher (resolve 'hive-hot.watcher/create-watcher)
-         watcher-start! (resolve 'hive-hot.watcher/start!)
-         watcher-stop! (resolve 'hive-hot.watcher/stop!)
-         create-debouncer (resolve 'hive-hot.debounce/create-debouncer)
-         handle-event! (resolve 'hive-hot.debounce/handle-event!)
-         stop-debouncer! (resolve 'hive-hot.debounce/stop-debouncer!)]
+     (let [create-watcher (resolve 'hive-hot.watcher/create-watcher)
+           watcher-start! (resolve 'hive-hot.watcher/start!)
+           watcher-stop! (resolve 'hive-hot.watcher/stop!)
+           create-debouncer (resolve 'hive-hot.debounce/create-debouncer)
+           handle-event! (resolve 'hive-hot.debounce/handle-event!)
+           stop-debouncer! (resolve 'hive-hot.debounce/stop-debouncer!)]
 
-     ;; Stop existing watcher if any
-     (when-let [state @watcher-state]
-       (when-let [stop (:stop-fn state)]
-         (stop)))
+       ;; Stop existing watcher if any
+       (when-let [state @watcher-state]
+         (when-let [stop (:stop-fn state)]
+           (stop)))
 
-     ;; Create debouncer that triggers reload on file changes
-     ;; Callback receives a set of file paths
-     (let [debouncer (create-debouncer
-                      (fn [files]
-                        ;; Emit file/changed events for each file
-                        (doseq [file files]
-                          (events/emit-file-changed! (str file) :modify))
-                        ;; Trigger reload
-                        (reload-scoped! (changed-roots dirs files)))
-                      claim-checker
-                      :cooldown-ms debounce-ms)
-           ;; Create watcher
-           watcher (create-watcher)]
+       ;; Create debouncer that triggers reload on file changes
+       ;; Callback receives a set of file paths
+       (let [debouncer (create-debouncer
+                        (fn [files]
+                          ;; Emit file/changed events for each file
+                          (doseq [file files]
+                            (events/emit-file-changed! (str file) :modify))
+                          ;; Trigger reload
+                          (reload-scoped! (changed-roots dirs files)))
+                        claim-checker
+                        :cooldown-ms debounce-ms)
+             ;; Create watcher
+             watcher (create-watcher)]
 
-       ;; Start watcher with callback that feeds events to debouncer
-       (watcher-start! watcher dirs
-                       (fn [{:keys [file type]}]
-                         (handle-event! debouncer {:file file :type type})))
+         ;; Start watcher with callback that feeds events to debouncer
+         (watcher-start! watcher dirs
+                         (fn [{:keys [file type]}]
+                           (handle-event! debouncer {:file file :type type})))
 
-       ;; Store state for cleanup (dirs for introspection, opts so extend-init!
-       ;; can restart the watcher over a wider dir set)
-       (reset! watcher-state
-               {:watcher watcher
-                :debouncer debouncer
-                :dirs dirs
-                :opts (assoc opts :dirs dirs)
-                :stop-fn (fn []
-                           (watcher-stop! watcher)
-                           (stop-debouncer! debouncer)
-                           (reset! watcher-state nil))})
+         ;; Store state for cleanup (dirs for introspection, opts so extend-init!
+         ;; can restart the watcher over a wider dir set)
+         (reset! watcher-state
+                 {:watcher watcher
+                  :debouncer debouncer
+                  :dirs dirs
+                  :opts (assoc opts :dirs dirs :watch-local-roots? false)
+                  :stop-fn (fn []
+                             (watcher-stop! watcher)
+                             (stop-debouncer! debouncer)
+                             (reset! watcher-state nil))})
 
-       :watching))))
+         :watching)))))
 
 (defn stop-watcher!
   "Stop the file watcher if running."
