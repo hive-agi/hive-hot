@@ -18,7 +18,8 @@
             [clj-reload.parse :as parse]
             [clojure.java.io :as io]
             [hive-hot.events :as events]
-            [hive-hot.dirs :as dirs])
+            [hive-hot.dirs :as dirs]
+            [hive-hot.protocols :as protocols])
   (:import [java.io File]))
 
 ;; =============================================================================
@@ -281,13 +282,24 @@
                                         unchanged dependents; potential namespace
                                         reloads, before live/no-reload filtering.
                                         Untracked namespaces are not covered.
-      :mask      #{ns ...}              namespaces pinned :no-reload for the run
+      :mask      #{ns ...}              namespaces pinned :no-reload for the run,
+                                        including the :pinned protocol definers
       :withheld  #{ns ...}              work clj-reload holds QUEUED (from an
                                         earlier, failed or unscoped pass) for
                                         namespaces outside the roots and the
                                         cascade — taken out of the pass and
                                         put back after it
       :queued    [ns ...]               queued work the pass does run
+      :definers  {ns #{ns ...}}         protocol/interface definers in the
+                                        cascade the pass reloads, each with the
+                                        live namespaces that MUST be reloaded
+                                        after it (implementors and direct
+                                        dependents; see hive-hot.protocols)
+      :pinned    {ns {:reason kw :implementors [ns ...]}}
+                                        protocol definers in the cascade NOT
+                                        reloaded in place: outside the roots, or
+                                        implemented by a namespace no reload can
+                                        reach
       :since     long | nil             the :since window the run needs, nil
                                         when there is nothing to load
       :old-since long}"
@@ -323,22 +335,40 @@
         mask      (into #{}
                         (comp (remove admitted) (mapcat nses-of) (remove closure))
                         exposed)
+        ;; The protocol interlock: which definers in the cascade the pass
+        ;; reloads (and who must follow each), which it must leave in place.
+        ns-files  (fn [ns] (get-in state [:namespaces ns :ns-files]))
+        no-reload (into (set (:no-reload (reload-config))) mask)
+        interlock (when (seq closure)
+                    (protocols/analyze
+                      {:candidates (remove no-reload closure)
+                       :deps       deps
+                       :tracked?   #(contains? (:namespaces state) %)
+                       :no-reload  no-reload
+                       :in-roots?  (if roots*
+                                     #(boolean (some in-roots? (ns-files %)))
+                                     (constantly true))}))
+        pinned    (:pinned interlock {})
+        mask      (into mask (keys pinned))
         ;; Work an earlier pass left queued in clj-reload (a failed load is
         ;; consed back onto :to-unload, the rest of :to-load stays) is replayed
         ;; by the next pass whoever runs it. Attribute it by file: a queued
         ;; namespace outside the roots and the cascade is WITHHELD.
         queued    (distinct (concat (:to-unload state) (:to-load state)))
         foreign?  (fn [ns]
-                    (let [files (get-in state [:namespaces ns :ns-files])]
+                    (let [files (ns-files ns)]
                       (boolean
                         (and roots* (seq files) (not (closure ns))
                              (not-any? in-roots? files)))))
-        withheld  (into #{} (filter foreign?) queued)]
+        withheld  (into (set (filter foreign? queued))
+                        (filter pinned) queued)]
     {:roots roots* :want want :dragged dragged :skipped (vec skipped)
      :cascade (vec (sort closure))
      :mask mask :since window :old-since old-since
      :withheld withheld
-     :queued (vec (remove withheld queued))}))
+     :queued (vec (remove withheld queued))
+     :definers (:definers interlock {})
+     :pinned pinned}))
 
 (defn- live-ns?
   "Whether `ns-obj` is still the Namespace object the image resolves its name to."
@@ -522,6 +552,46 @@
       (:exception result) (diagnostic/with-root-cause)
       stale               (assoc :stale-registrations stale)))))
 
+(defn- complete-protocol-cascade!
+  "After a pass that reloaded protocol definers: reload every namespace that
+   had to follow a definer but did not (see hive-hot.protocols/stale-followers)
+   - an implementor clj-reload skipped because the require graph does not reach
+   it or because it is missing from *loaded-libs*, or one it loaded BEFORE the
+   definer. The followers are queued in clj-reload's own :to-unload / :to-load,
+   in dependency order, and a further pass runs them under the same mask.
+   Repeats while a follow-up pass leaves stale followers, at most 3 times.
+
+   Returns `result` with the follow-up passes' :unloaded / :loaded appended and
+   :protocol-cascade [{:definer ns :reloaded [ns ...]} ...]; a failing follow-up
+   pass makes the result fail with its :failed / :exception."
+  [result plan clj-opts]
+  (loop [result result, n 0, cascade []]
+    (let [stale (protocols/stale-followers (:definers plan) (:loaded result))]
+      (if (or (empty? stale) (:failed result) (>= n 3))
+        (cond-> result
+          (seq cascade) (assoc :protocol-cascade cascade)
+          (seq stale)   (assoc :protocol-stale
+                               (into (sorted-map)
+                                     (map (fn [[d s]] [(str d) (mapv str s)]))
+                                     stale)))
+        (let [state  (reload-state)
+              order  (parse/topo-sort (parse/dependees (:namespaces state)))
+              follow (into #{} cat (vals stale))
+              sorted (filterv follow order)
+              _      (swap! (state-atom)
+                            (fn [s] (-> s
+                                        (assoc :to-unload (vec (distinct (concat (reverse sorted) (:to-unload s)))))
+                                        (assoc :to-load (vec (distinct (concat (:to-load s) sorted)))))))
+              more   (run-clj-reload! (assoc plan :since nil) clj-opts)]
+          (recur (-> result
+                     (update :unloaded #(into (vec %) (:unloaded more)))
+                     (update :loaded #(into (vec %) (:loaded more)))
+                     (merge (select-keys more [:failed :exception])))
+                 (inc n)
+                 (into cascade
+                       (map (fn [[d s]] {:definer (str d) :reloaded (mapv str s)}))
+                       (sort-by key stale))))))))
+
 (defn reload-scoped!
   "Reload the changes under `roots` — and only those.
 
@@ -545,6 +615,18 @@
    progress cannot fail every other root's reload, and its own root's reload
    still finds it.
 
+   Protocol interlock (see hive-hot.protocols). Reloading a namespace that
+   defines a protocol or interface orphans every implementation compiled
+   against the old one. So a protocol definer in the cascade is either
+     - reloaded, and then EVERY live namespace implementing it (defrecord,
+       deftype, extend, extend-type, extend-protocol - whether or not the
+       require graph or *loaded-libs* reaches it) and every direct dependent
+       is reloaded after it, in dependency order, by a follow-up pass when
+       clj-reload's own cascade missed one; or
+     - PINNED - not reloaded in place - when it lies outside `roots` or one of
+       its implementors is not tracked (a jar, a REPL namespace) and so could
+       never be reloaded after it.
+
    Returns clj-reload's result plus:
      :success    bool
      :ms         elapsed
@@ -556,7 +638,16 @@
      :pending?   true when the pass ran for queued work alone
      :withheld   [ns-string ...]  queued work outside the roots, NOT run and
                                   left queued (present only when non-empty)
-     :multi-file {ns [path ...]}  loaded namespaces found in more than one file"
+     :multi-file {ns [path ...]}  loaded namespaces found in more than one file
+     :protocol-cascade [{:definer ns-string :reloaded [ns-string ...]} ...]
+                                  implementors a follow-up pass reloaded after
+                                  a protocol definer (present only when one ran)
+     :protocol-stale {ns-string [ns-string ...]}
+                                  implementors STILL not reloaded after their
+                                  definer (present only when non-empty)
+     :pinned-protocols [{:ns :reason :implementors} ...]
+                                  protocol definers in the cascade NOT reloaded
+                                  in place (present only when non-empty)"
   ([roots] (reload-scoped! roots {}))
   ([roots opts]
    (ensure-initialized!)
@@ -571,8 +662,10 @@
                           files))
          skipped  (nses-of (:skipped plan))
          dragged  (nses-of (:dragged plan))
+         clj-opts (select-keys opts [:log-fn])
          result   (if (or (:since plan) pending?)
-                    (run-clj-reload! plan (select-keys opts [:log-fn]))
+                    (-> (run-clj-reload! plan clj-opts)
+                        (complete-protocol-cascade! plan clj-opts))
                     {:unloaded [] :loaded []})
          _        (record-loaded! (:old-since plan) (:loaded result))
          multi    (multi-file-namespaces (:loaded result))
@@ -585,6 +678,7 @@
                     :unchanged? (nil? (:since plan))
                     :pending? (and pending? (nil? (:since plan))))
        (seq (:withheld plan)) (assoc :withheld (mapv str (sort (:withheld plan))))
+       (seq (:pinned plan))   (assoc :pinned-protocols (protocols/pinned-report (:pinned plan)))
        (seq multi)            (assoc :multi-file multi)))))
 
 (defn reload!
