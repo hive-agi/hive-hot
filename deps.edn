@@ -25,6 +25,11 @@
                       io.github.hive-agi/hive-spi {:mvn/version "1.4.4"}
                       org.clojure/test.check {:mvn/version "1.1.3"}
                       io.github.hive-agi/hive-test {:mvn/version "0.4.11"}}
+         ;; Heap cap: an uncapped JVM sizes its heap from host RAM, and an
+         ;; uncapped test JVM OOM-killed the shared host twice on 2026-10-17.
+         ;; This suite is small; 1500m leaves ample headroom. A -J-Xmx on the
+         ;; command line comes after alias :jvm-opts and still overrides it.
+         :jvm-opts ["-Xmx1500m"]
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
 
