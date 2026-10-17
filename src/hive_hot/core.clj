@@ -18,7 +18,8 @@
             [clj-reload.parse :as parse]
             [clojure.java.io :as io]
             [hive-hot.events :as events]
-            [hive-hot.dirs :as dirs])
+            [hive-hot.dirs :as dirs]
+            [hive-hot.protocols :as protocols])
   (:import [java.io File]))
 
 ;; =============================================================================
@@ -269,6 +270,14 @@
    root, and closes the wanted namespaces forward over the current require
    graph. `roots` nil or empty means every tracked dir.
 
+   opts:
+     :force?  treat EVERY tracked file under the roots as changed, whatever its
+              mtime. The image can diverge from disk without any file moving
+              (a load-file from another checkout, a REPL redefinition), and an
+              mtime scan cannot see that; a forced plan re-reads the roots so the
+              image matches the source they hold again. Dependents still
+              cascade and :no-reload still masks.
+
    Returns
      {:roots     [canonical root ...]   nil when unscoped
       :want      [File ...]             changed under the roots — loaded
@@ -281,64 +290,98 @@
                                         unchanged dependents; potential namespace
                                         reloads, before live/no-reload filtering.
                                         Untracked namespaces are not covered.
-      :mask      #{ns ...}              namespaces pinned :no-reload for the run
+      :mask      #{ns ...}              namespaces pinned :no-reload for the run,
+                                        including the :pinned protocol definers
       :withheld  #{ns ...}              work clj-reload holds QUEUED (from an
                                         earlier, failed or unscoped pass) for
                                         namespaces outside the roots and the
                                         cascade — taken out of the pass and
                                         put back after it
       :queued    [ns ...]               queued work the pass does run
+      :definers  {ns #{ns ...}}         protocol/interface definers in the
+                                        cascade the pass reloads, each with the
+                                        live namespaces that MUST be reloaded
+                                        after it (implementors and direct
+                                        dependents; see hive-hot.protocols)
+      :pinned    {ns {:reason kw :implementors [ns ...]}}
+                                        protocol definers in the cascade NOT
+                                        reloaded in place: outside the roots, or
+                                        implemented by a namespace no reload can
+                                        reach
       :since     long | nil             the :since window the run needs, nil
                                         when there is nothing to load
-      :old-since long}"
-  [roots]
-  (let [state     (reload-state)
-        old-since (:since state 0)
-        roots*    (some->> (seq roots) (mapv canonical))
-        mtime     (fn [^File f] (.lastModified f))
-        all       (tracked-files)
-        baseline  (fn [f] (get @seen f old-since))
-        changed   (filterv #(> (mtime %) (baseline %)) all)
-        in-roots? (if roots*
-                    (fn [f] (let [p (canonical f)]
-                              (boolean (some #(under-root? % p) roots*))))
-                    (constantly true))
-        {want true outside false} (group-by in-roots? changed)
-        want      (vec want)
-        nses-of   (fn [f] (or (file-namespaces state f) #{}))
-        want-nses (into #{} (mapcat nses-of) want)
-        deps      (parse/dependees (:namespaces state))
-        closure   (set (parse/transitive-closure deps (vec want-nses)))
-        {dragged true skipped false} (group-by (fn [f] (boolean (some closure (nses-of f))))
-                                               outside)
-        dragged   (vec dragged)
-        admitted  (into (set want) dragged)
-        window    (when (seq admitted)
-                    (dec (transduce (map mtime) min Long/MAX_VALUE admitted)))
-        ;; run-clj-reload! scans from the EARLIER of the old baseline and
-        ;; the admitted window. Mask that same interval, including unrelated
-        ;; edits saved before the requested files.
-        scan-since (when window (min old-since window))
-        exposed   (when scan-since (filter #(> (mtime %) scan-since) all))
-        mask      (into #{}
-                        (comp (remove admitted) (mapcat nses-of) (remove closure))
-                        exposed)
-        ;; Work an earlier pass left queued in clj-reload (a failed load is
-        ;; consed back onto :to-unload, the rest of :to-load stays) is replayed
-        ;; by the next pass whoever runs it. Attribute it by file: a queued
-        ;; namespace outside the roots and the cascade is WITHHELD.
-        queued    (distinct (concat (:to-unload state) (:to-load state)))
-        foreign?  (fn [ns]
-                    (let [files (get-in state [:namespaces ns :ns-files])]
-                      (boolean
-                        (and roots* (seq files) (not (closure ns))
-                             (not-any? in-roots? files)))))
-        withheld  (into #{} (filter foreign?) queued)]
-    {:roots roots* :want want :dragged dragged :skipped (vec skipped)
-     :cascade (vec (sort closure))
-     :mask mask :since window :old-since old-since
-     :withheld withheld
-     :queued (vec (remove withheld queued))}))
+      :old-since long
+      :forced?   bool}"
+  ([roots] (scope-plan roots {}))
+  ([roots {:keys [force?]}]
+   (let [state     (reload-state)
+         old-since (:since state 0)
+         roots*    (some->> (seq roots) (mapv canonical))
+         mtime     (fn [^File f] (.lastModified f))
+         all       (tracked-files)
+         baseline  (fn [f] (get @seen f old-since))
+         in-roots? (if roots*
+                     (fn [f] (let [p (canonical f)]
+                               (boolean (some #(under-root? % p) roots*))))
+                     (constantly true))
+         changed   (filterv #(or (and force? (in-roots? %))
+                                 (> (mtime %) (baseline %)))
+                            all)
+         {want true outside false} (group-by in-roots? changed)
+         want      (vec want)
+         nses-of   (fn [f] (or (file-namespaces state f) #{}))
+         want-nses (into #{} (mapcat nses-of) want)
+         deps      (parse/dependees (:namespaces state))
+         closure   (set (parse/transitive-closure deps (vec want-nses)))
+         {dragged true skipped false} (group-by (fn [f] (boolean (some closure (nses-of f))))
+                                                outside)
+         dragged   (vec dragged)
+         admitted  (into (set want) dragged)
+         window    (when (seq admitted)
+                     (dec (transduce (map mtime) min Long/MAX_VALUE admitted)))
+         ;; run-clj-reload! scans from the EARLIER of the old baseline and
+         ;; the admitted window. Mask that same interval, including unrelated
+         ;; edits saved before the requested files.
+         scan-since (when window (min old-since window))
+         exposed   (when scan-since (filter #(> (mtime %) scan-since) all))
+         mask      (into #{}
+                         (comp (remove admitted) (mapcat nses-of) (remove closure))
+                         exposed)
+         ;; The protocol interlock: which definers in the cascade the pass
+         ;; reloads (and who must follow each), which it must leave in place.
+         ns-files  (fn [ns] (get-in state [:namespaces ns :ns-files]))
+         no-reload (into (set (:no-reload (reload-config))) mask)
+         interlock (when (seq closure)
+                     (protocols/analyze
+                       {:candidates (remove no-reload closure)
+                        :deps       deps
+                        :tracked?   #(contains? (:namespaces state) %)
+                        :no-reload  no-reload
+                        :in-roots?  (if roots*
+                                      #(boolean (some in-roots? (ns-files %)))
+                                      (constantly true))}))
+         pinned    (:pinned interlock {})
+         mask      (into mask (keys pinned))
+         ;; Work an earlier pass left queued in clj-reload (a failed load is
+         ;; consed back onto :to-unload, the rest of :to-load stays) is replayed
+         ;; by the next pass whoever runs it. Attribute it by file: a queued
+         ;; namespace outside the roots and the cascade is WITHHELD.
+         queued    (distinct (concat (:to-unload state) (:to-load state)))
+         foreign?  (fn [ns]
+                     (let [files (ns-files ns)]
+                       (boolean
+                         (and roots* (seq files) (not (closure ns))
+                              (not-any? in-roots? files)))))
+         withheld  (into (set (filter foreign? queued))
+                         (filter pinned) queued)]
+     {:roots roots* :want want :dragged dragged :skipped (vec skipped)
+      :cascade (vec (sort closure))
+      :mask mask :since window :old-since old-since
+      :withheld withheld
+      :queued (vec (remove withheld queued))
+      :definers (:definers interlock {})
+      :pinned pinned
+      :forced? (boolean force?)})))
 
 (defn- live-ns?
   "Whether `ns-obj` is still the Namespace object the image resolves its name to."
@@ -522,6 +565,46 @@
       (:exception result) (diagnostic/with-root-cause)
       stale               (assoc :stale-registrations stale)))))
 
+(defn- complete-protocol-cascade!
+  "After a pass that reloaded protocol definers: reload every namespace that
+   had to follow a definer but did not (see hive-hot.protocols/stale-followers)
+   - an implementor clj-reload skipped because the require graph does not reach
+   it or because it is missing from *loaded-libs*, or one it loaded BEFORE the
+   definer. The followers are queued in clj-reload's own :to-unload / :to-load,
+   in dependency order, and a further pass runs them under the same mask.
+   Repeats while a follow-up pass leaves stale followers, at most 3 times.
+
+   Returns `result` with the follow-up passes' :unloaded / :loaded appended and
+   :protocol-cascade [{:definer ns :reloaded [ns ...]} ...]; a failing follow-up
+   pass makes the result fail with its :failed / :exception."
+  [result plan clj-opts]
+  (loop [result result, n 0, cascade []]
+    (let [stale (protocols/stale-followers (:definers plan) (:loaded result))]
+      (if (or (empty? stale) (:failed result) (>= n 3))
+        (cond-> result
+          (seq cascade) (assoc :protocol-cascade cascade)
+          (seq stale)   (assoc :protocol-stale
+                               (into (sorted-map)
+                                     (map (fn [[d s]] [(str d) (mapv str s)]))
+                                     stale)))
+        (let [state  (reload-state)
+              order  (parse/topo-sort (parse/dependees (:namespaces state)))
+              follow (into #{} cat (vals stale))
+              sorted (filterv follow order)
+              _      (swap! (state-atom)
+                            (fn [s] (-> s
+                                        (assoc :to-unload (vec (distinct (concat (reverse sorted) (:to-unload s)))))
+                                        (assoc :to-load (vec (distinct (concat (:to-load s) sorted)))))))
+              more   (run-clj-reload! (assoc plan :since nil) clj-opts)]
+          (recur (-> result
+                     (update :unloaded #(into (vec %) (:unloaded more)))
+                     (update :loaded #(into (vec %) (:loaded more)))
+                     (merge (select-keys more [:failed :exception])))
+                 (inc n)
+                 (into cascade
+                       (map (fn [[d s]] {:definer (str d) :reloaded (mapv str s)}))
+                       (sort-by key stale))))))))
+
 (defn reload-scoped!
   "Reload the changes under `roots` — and only those.
 
@@ -532,6 +615,10 @@
    live), and DECLINES every other change: those files keep their baseline and
    stay pending for the reload that owns their root. `roots` nil or empty means
    every tracked dir.
+
+   opts :force? true admits every tracked file under the roots whatever its
+   mtime (see scope-plan): the repair for an image that diverged from disk
+   without any file changing.
 
    A pass also runs when nothing under the roots changed but clj-reload holds
    work an earlier pass left queued (a namespace unloaded and never loaded, or
@@ -545,18 +632,40 @@
    progress cannot fail every other root's reload, and its own root's reload
    still finds it.
 
+   Protocol interlock (see hive-hot.protocols). Reloading a namespace that
+   defines a protocol or interface orphans every implementation compiled
+   against the old one. So a protocol definer in the cascade is either
+     - reloaded, and then EVERY live namespace implementing it (defrecord,
+       deftype, extend, extend-type, extend-protocol - whether or not the
+       require graph or *loaded-libs* reaches it) and every direct dependent
+       is reloaded after it, in dependency order, by a follow-up pass when
+       clj-reload's own cascade missed one; or
+     - PINNED - not reloaded in place - when it lies outside `roots` or one of
+       its implementors is not tracked (a jar, a REPL namespace) and so could
+       never be reloaded after it.
+
    Returns clj-reload's result plus:
      :success    bool
      :ms         elapsed
      :scoped?    true when roots were given
      :roots      the canonical roots
+     :forced?    true when the pass ran with :force?
      :skipped    [ns-string ...]  changed outside the roots, NOT loaded
      :dragged    [ns-string ...]  changed outside the roots, loaded as dependents
      :unchanged? true when nothing under the roots had changed
      :pending?   true when the pass ran for queued work alone
      :withheld   [ns-string ...]  queued work outside the roots, NOT run and
                                   left queued (present only when non-empty)
-     :multi-file {ns [path ...]}  loaded namespaces found in more than one file"
+     :multi-file {ns [path ...]}  loaded namespaces found in more than one file
+     :protocol-cascade [{:definer ns-string :reloaded [ns-string ...]} ...]
+                                  implementors a follow-up pass reloaded after
+                                  a protocol definer (present only when one ran)
+     :protocol-stale {ns-string [ns-string ...]}
+                                  implementors STILL not reloaded after their
+                                  definer (present only when non-empty)
+     :pinned-protocols [{:ns :reason :implementors} ...]
+                                  protocol definers in the cascade NOT reloaded
+                                  in place (present only when non-empty)"
   ([roots] (reload-scoped! roots {}))
   ([roots opts]
    (ensure-initialized!)
@@ -564,15 +673,17 @@
    (events/emit-reload-start!)
    (let [start    (System/currentTimeMillis)
          state    (reload-state)
-         plan     (scope-plan roots)
+         plan     (scope-plan roots (select-keys opts [:force?]))
          pending? (boolean (seq (:queued plan)))
          nses-of  (fn [files]
                     (into [] (comp (mapcat #(file-namespaces state %)) (distinct) (map str))
                           files))
          skipped  (nses-of (:skipped plan))
          dragged  (nses-of (:dragged plan))
+         clj-opts (select-keys opts [:log-fn])
          result   (if (or (:since plan) pending?)
-                    (run-clj-reload! plan (select-keys opts [:log-fn]))
+                    (-> (run-clj-reload! plan clj-opts)
+                        (complete-protocol-cascade! plan clj-opts))
                     {:unloaded [] :loaded []})
          _        (record-loaded! (:old-since plan) (:loaded result))
          multi    (multi-file-namespaces (:loaded result))
@@ -580,11 +691,13 @@
      (cond-> (assoc out
                     :scoped? (some? (:roots plan))
                     :roots (or (:roots plan) [])
+                    :forced? (:forced? plan)
                     :skipped skipped
                     :dragged dragged
                     :unchanged? (nil? (:since plan))
                     :pending? (and pending? (nil? (:since plan))))
        (seq (:withheld plan)) (assoc :withheld (mapv str (sort (:withheld plan))))
+       (seq (:pinned plan))   (assoc :pinned-protocols (protocols/pinned-report (:pinned plan)))
        (seq multi)            (assoc :multi-file multi)))))
 
 (defn reload!
@@ -852,6 +965,47 @@
         {:initialized? true :fresh? true
          :dirs (vec (:dirs (reload-config))) :added (vec (:dirs opts))})))
 
+(defn changed-roots
+  "The watched `dirs` that contain at least one of the changed `files`, as
+   sorted canonical paths, each once.
+
+   The watcher's debounced reload passes these to `reload-scoped!`, so a save
+   under one repo reloads that repo (plus the namespaces that depend on it)
+   and leaves a co-tenant's half-saved file under another watched dir pending
+   for the reload that owns it. A file under no watched dir contributes no
+   root."
+  [dirs files]
+  (let [roots (mapv canonical dirs)
+        paths (mapv canonical files)]
+    (into [] (comp (filter (fn [root] (some #(under-root? root %) paths)))
+                   (distinct))
+          (sort roots))))
+
+(defn local-root-source-dirs
+  "Existing source directories of :local/root libraries in a tools.deps basis.
+   Library :paths are relative to their own root, never to the host cwd.
+   The classpath roots in a basis may also contain jars and unrelated host
+   paths, so only explicit local-root library entries are selected."
+  [basis]
+  (into []
+        (comp (mapcat (fn [[_ {:keys [local/root paths]}]]
+                        (when root
+                          (for [path paths]
+                            (io/file root path)))))
+              (filter #(.isDirectory ^File %))
+              (map canonical)
+              (distinct))
+        (:libs basis)))
+
+(defn- current-local-root-dirs
+  "Read the host's tools.deps basis when available. A deployed jar may not
+   include clojure.java.basis; in that case explicit :dirs still work."
+  []
+  (if-let [current-basis (try (requiring-resolve 'clojure.java.basis/current-basis)
+                              (catch java.io.FileNotFoundException _ nil))]
+    (local-root-source-dirs (current-basis))
+    []))
+
 (defn init-with-watcher!
   "Initialize hive-hot with file watcher and coordinating debouncer.
 
@@ -867,6 +1021,8 @@
    - :debounce-ms   - Debounce window in ms (default: 100)
    - :no-reload     - Namespaces to never reload
    - :no-unload     - Namespaces to reload but not unload
+   - :watch-local-roots? - Include existing source dirs of tools.deps
+                          :local/root libraries (default: true)
 
    clj-reload is initialized through `ensure-init!`: an already-initialized
    registry is EXTENDED with the dirs, never reset, so a change made between
@@ -897,64 +1053,67 @@
 
    Returns :watching on success."
   ([] (init-with-watcher! {}))
-  ([{:keys [dirs claim-checker debounce-ms no-reload no-unload]
+  ([{:keys [dirs claim-checker debounce-ms no-reload no-unload watch-local-roots?]
      :or {dirs ["src"]
           claim-checker (constantly #{})
-          debounce-ms 100}
+          debounce-ms 100
+          watch-local-roots? true}
      :as opts}]
-   ;; Initialize clj-reload — extending, never resetting, an initialized registry
-   (ensure-init! (cond-> {:dirs dirs}
-                   no-reload (assoc :no-reload no-reload)
-                   no-unload (assoc :no-unload no-unload)))
+   (let [dirs (into (vec dirs) (remove (set (map canonical dirs)))
+                    (if watch-local-roots? (current-local-root-dirs) []))]
+     ;; Initialize clj-reload — extending, never resetting, an initialized registry
+     (ensure-init! (cond-> {:dirs dirs}
+                     no-reload (assoc :no-reload no-reload)
+                     no-unload (assoc :no-unload no-unload)))
 
-   ;; Require watcher and debouncer namespaces dynamically
-   (require 'hive-hot.watcher)
-   (require 'hive-hot.debounce)
+     ;; Require watcher and debouncer namespaces dynamically
+     (require 'hive-hot.watcher)
+     (require 'hive-hot.debounce)
 
-   (let [create-watcher (resolve 'hive-hot.watcher/create-watcher)
-         watcher-start! (resolve 'hive-hot.watcher/start!)
-         watcher-stop! (resolve 'hive-hot.watcher/stop!)
-         create-debouncer (resolve 'hive-hot.debounce/create-debouncer)
-         handle-event! (resolve 'hive-hot.debounce/handle-event!)
-         stop-debouncer! (resolve 'hive-hot.debounce/stop-debouncer!)]
+     (let [create-watcher (resolve 'hive-hot.watcher/create-watcher)
+           watcher-start! (resolve 'hive-hot.watcher/start!)
+           watcher-stop! (resolve 'hive-hot.watcher/stop!)
+           create-debouncer (resolve 'hive-hot.debounce/create-debouncer)
+           handle-event! (resolve 'hive-hot.debounce/handle-event!)
+           stop-debouncer! (resolve 'hive-hot.debounce/stop-debouncer!)]
 
-     ;; Stop existing watcher if any
-     (when-let [state @watcher-state]
-       (when-let [stop (:stop-fn state)]
-         (stop)))
+       ;; Stop existing watcher if any
+       (when-let [state @watcher-state]
+         (when-let [stop (:stop-fn state)]
+           (stop)))
 
-     ;; Create debouncer that triggers reload on file changes
-     ;; Callback receives a set of file paths
-     (let [debouncer (create-debouncer
-                      (fn [files]
-                        ;; Emit file/changed events for each file
-                        (doseq [file files]
-                          (events/emit-file-changed! (str file) :modify))
-                        ;; Trigger reload
-                        (reload!))
-                      claim-checker
-                      :cooldown-ms debounce-ms)
-           ;; Create watcher
-           watcher (create-watcher)]
+       ;; Create debouncer that triggers reload on file changes
+       ;; Callback receives a set of file paths
+       (let [debouncer (create-debouncer
+                        (fn [files]
+                          ;; Emit file/changed events for each file
+                          (doseq [file files]
+                            (events/emit-file-changed! (str file) :modify))
+                          ;; Trigger reload
+                          (reload-scoped! (changed-roots dirs files)))
+                        claim-checker
+                        :cooldown-ms debounce-ms)
+             ;; Create watcher
+             watcher (create-watcher)]
 
-       ;; Start watcher with callback that feeds events to debouncer
-       (watcher-start! watcher dirs
-                       (fn [{:keys [file type]}]
-                         (handle-event! debouncer {:file file :type type})))
+         ;; Start watcher with callback that feeds events to debouncer
+         (watcher-start! watcher dirs
+                         (fn [{:keys [file type]}]
+                           (handle-event! debouncer {:file file :type type})))
 
-       ;; Store state for cleanup (dirs for introspection, opts so extend-init!
-       ;; can restart the watcher over a wider dir set)
-       (reset! watcher-state
-               {:watcher watcher
-                :debouncer debouncer
-                :dirs dirs
-                :opts (assoc opts :dirs dirs)
-                :stop-fn (fn []
-                           (watcher-stop! watcher)
-                           (stop-debouncer! debouncer)
-                           (reset! watcher-state nil))})
+         ;; Store state for cleanup (dirs for introspection, opts so extend-init!
+         ;; can restart the watcher over a wider dir set)
+         (reset! watcher-state
+                 {:watcher watcher
+                  :debouncer debouncer
+                  :dirs dirs
+                  :opts (assoc opts :dirs dirs :watch-local-roots? false)
+                  :stop-fn (fn []
+                             (watcher-stop! watcher)
+                             (stop-debouncer! debouncer)
+                             (reset! watcher-state nil))})
 
-       :watching))))
+         :watching)))))
 
 (defn stop-watcher!
   "Stop the file watcher if running."
