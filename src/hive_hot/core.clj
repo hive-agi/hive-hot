@@ -270,6 +270,14 @@
    root, and closes the wanted namespaces forward over the current require
    graph. `roots` nil or empty means every tracked dir.
 
+   opts:
+     :force?  treat EVERY tracked file under the roots as changed, whatever its
+              mtime. The image can diverge from disk without any file moving
+              (a load-file from another checkout, a REPL redefinition), and an
+              mtime scan cannot see that; a forced plan re-reads the roots so the
+              image matches the source they hold again. Dependents still
+              cascade and :no-reload still masks.
+
    Returns
      {:roots     [canonical root ...]   nil when unscoped
       :want      [File ...]             changed under the roots — loaded
@@ -302,73 +310,78 @@
                                         reach
       :since     long | nil             the :since window the run needs, nil
                                         when there is nothing to load
-      :old-since long}"
-  [roots]
-  (let [state     (reload-state)
-        old-since (:since state 0)
-        roots*    (some->> (seq roots) (mapv canonical))
-        mtime     (fn [^File f] (.lastModified f))
-        all       (tracked-files)
-        baseline  (fn [f] (get @seen f old-since))
-        changed   (filterv #(> (mtime %) (baseline %)) all)
-        in-roots? (if roots*
-                    (fn [f] (let [p (canonical f)]
-                              (boolean (some #(under-root? % p) roots*))))
-                    (constantly true))
-        {want true outside false} (group-by in-roots? changed)
-        want      (vec want)
-        nses-of   (fn [f] (or (file-namespaces state f) #{}))
-        want-nses (into #{} (mapcat nses-of) want)
-        deps      (parse/dependees (:namespaces state))
-        closure   (set (parse/transitive-closure deps (vec want-nses)))
-        {dragged true skipped false} (group-by (fn [f] (boolean (some closure (nses-of f))))
-                                               outside)
-        dragged   (vec dragged)
-        admitted  (into (set want) dragged)
-        window    (when (seq admitted)
-                    (dec (transduce (map mtime) min Long/MAX_VALUE admitted)))
-        ;; run-clj-reload! scans from the EARLIER of the old baseline and
-        ;; the admitted window. Mask that same interval, including unrelated
-        ;; edits saved before the requested files.
-        scan-since (when window (min old-since window))
-        exposed   (when scan-since (filter #(> (mtime %) scan-since) all))
-        mask      (into #{}
-                        (comp (remove admitted) (mapcat nses-of) (remove closure))
-                        exposed)
-        ;; The protocol interlock: which definers in the cascade the pass
-        ;; reloads (and who must follow each), which it must leave in place.
-        ns-files  (fn [ns] (get-in state [:namespaces ns :ns-files]))
-        no-reload (into (set (:no-reload (reload-config))) mask)
-        interlock (when (seq closure)
-                    (protocols/analyze
-                      {:candidates (remove no-reload closure)
-                       :deps       deps
-                       :tracked?   #(contains? (:namespaces state) %)
-                       :no-reload  no-reload
-                       :in-roots?  (if roots*
-                                     #(boolean (some in-roots? (ns-files %)))
-                                     (constantly true))}))
-        pinned    (:pinned interlock {})
-        mask      (into mask (keys pinned))
-        ;; Work an earlier pass left queued in clj-reload (a failed load is
-        ;; consed back onto :to-unload, the rest of :to-load stays) is replayed
-        ;; by the next pass whoever runs it. Attribute it by file: a queued
-        ;; namespace outside the roots and the cascade is WITHHELD.
-        queued    (distinct (concat (:to-unload state) (:to-load state)))
-        foreign?  (fn [ns]
-                    (let [files (ns-files ns)]
-                      (boolean
-                        (and roots* (seq files) (not (closure ns))
-                             (not-any? in-roots? files)))))
-        withheld  (into (set (filter foreign? queued))
-                        (filter pinned) queued)]
-    {:roots roots* :want want :dragged dragged :skipped (vec skipped)
-     :cascade (vec (sort closure))
-     :mask mask :since window :old-since old-since
-     :withheld withheld
-     :queued (vec (remove withheld queued))
-     :definers (:definers interlock {})
-     :pinned pinned}))
+      :old-since long
+      :forced?   bool}"
+  ([roots] (scope-plan roots {}))
+  ([roots {:keys [force?]}]
+   (let [state     (reload-state)
+         old-since (:since state 0)
+         roots*    (some->> (seq roots) (mapv canonical))
+         mtime     (fn [^File f] (.lastModified f))
+         all       (tracked-files)
+         baseline  (fn [f] (get @seen f old-since))
+         in-roots? (if roots*
+                     (fn [f] (let [p (canonical f)]
+                               (boolean (some #(under-root? % p) roots*))))
+                     (constantly true))
+         changed   (filterv #(or (and force? (in-roots? %))
+                                 (> (mtime %) (baseline %)))
+                            all)
+         {want true outside false} (group-by in-roots? changed)
+         want      (vec want)
+         nses-of   (fn [f] (or (file-namespaces state f) #{}))
+         want-nses (into #{} (mapcat nses-of) want)
+         deps      (parse/dependees (:namespaces state))
+         closure   (set (parse/transitive-closure deps (vec want-nses)))
+         {dragged true skipped false} (group-by (fn [f] (boolean (some closure (nses-of f))))
+                                                outside)
+         dragged   (vec dragged)
+         admitted  (into (set want) dragged)
+         window    (when (seq admitted)
+                     (dec (transduce (map mtime) min Long/MAX_VALUE admitted)))
+         ;; run-clj-reload! scans from the EARLIER of the old baseline and
+         ;; the admitted window. Mask that same interval, including unrelated
+         ;; edits saved before the requested files.
+         scan-since (when window (min old-since window))
+         exposed   (when scan-since (filter #(> (mtime %) scan-since) all))
+         mask      (into #{}
+                         (comp (remove admitted) (mapcat nses-of) (remove closure))
+                         exposed)
+         ;; The protocol interlock: which definers in the cascade the pass
+         ;; reloads (and who must follow each), which it must leave in place.
+         ns-files  (fn [ns] (get-in state [:namespaces ns :ns-files]))
+         no-reload (into (set (:no-reload (reload-config))) mask)
+         interlock (when (seq closure)
+                     (protocols/analyze
+                       {:candidates (remove no-reload closure)
+                        :deps       deps
+                        :tracked?   #(contains? (:namespaces state) %)
+                        :no-reload  no-reload
+                        :in-roots?  (if roots*
+                                      #(boolean (some in-roots? (ns-files %)))
+                                      (constantly true))}))
+         pinned    (:pinned interlock {})
+         mask      (into mask (keys pinned))
+         ;; Work an earlier pass left queued in clj-reload (a failed load is
+         ;; consed back onto :to-unload, the rest of :to-load stays) is replayed
+         ;; by the next pass whoever runs it. Attribute it by file: a queued
+         ;; namespace outside the roots and the cascade is WITHHELD.
+         queued    (distinct (concat (:to-unload state) (:to-load state)))
+         foreign?  (fn [ns]
+                     (let [files (ns-files ns)]
+                       (boolean
+                         (and roots* (seq files) (not (closure ns))
+                              (not-any? in-roots? files)))))
+         withheld  (into (set (filter foreign? queued))
+                         (filter pinned) queued)]
+     {:roots roots* :want want :dragged dragged :skipped (vec skipped)
+      :cascade (vec (sort closure))
+      :mask mask :since window :old-since old-since
+      :withheld withheld
+      :queued (vec (remove withheld queued))
+      :definers (:definers interlock {})
+      :pinned pinned
+      :forced? (boolean force?)})))
 
 (defn- live-ns?
   "Whether `ns-obj` is still the Namespace object the image resolves its name to."
@@ -603,6 +616,10 @@
    stay pending for the reload that owns their root. `roots` nil or empty means
    every tracked dir.
 
+   opts :force? true admits every tracked file under the roots whatever its
+   mtime (see scope-plan): the repair for an image that diverged from disk
+   without any file changing.
+
    A pass also runs when nothing under the roots changed but clj-reload holds
    work an earlier pass left queued (a namespace unloaded and never loaded, or
    one a caller queued): that work would otherwise wait for an unrelated edit.
@@ -632,6 +649,7 @@
      :ms         elapsed
      :scoped?    true when roots were given
      :roots      the canonical roots
+     :forced?    true when the pass ran with :force?
      :skipped    [ns-string ...]  changed outside the roots, NOT loaded
      :dragged    [ns-string ...]  changed outside the roots, loaded as dependents
      :unchanged? true when nothing under the roots had changed
@@ -655,7 +673,7 @@
    (events/emit-reload-start!)
    (let [start    (System/currentTimeMillis)
          state    (reload-state)
-         plan     (scope-plan roots)
+         plan     (scope-plan roots (select-keys opts [:force?]))
          pending? (boolean (seq (:queued plan)))
          nses-of  (fn [files]
                     (into [] (comp (mapcat #(file-namespaces state %)) (distinct) (map str))
@@ -673,6 +691,7 @@
      (cond-> (assoc out
                     :scoped? (some? (:roots plan))
                     :roots (or (:roots plan) [])
+                    :forced? (:forced? plan)
                     :skipped skipped
                     :dragged dragged
                     :unchanged? (nil? (:since plan))
