@@ -132,7 +132,10 @@
     (let [r (hot/reload-scoped! [proto-root])]
       (is (:success r) (pr-str (dissoc r :exception)))
       (is (identical? old-proto (v 'fixtures.proto.shape/IShape)))
-      (is (= 1 (v 'fixtures.proto.shape/version)))
+      (testing "pinned, the definer's non-type forms are refreshed in place"
+        (is (= 2 (v 'fixtures.proto.shape/version)))
+        (is (= ["fixtures.proto.shape"] (mapv :ns (:pinned-refreshed r))))
+        (is (= ["IShape"] (mapcat :types (:pinned-refreshed r)))))
       (is (= [{:ns "fixtures.proto.shape" :reason :untracked-implementors
                :implementors ["hivehot.repl-impl"]}]
              (:pinned-protocols r)))

@@ -19,7 +19,8 @@
             [clojure.java.io :as io]
             [hive-hot.events :as events]
             [hive-hot.dirs :as dirs]
-            [hive-hot.protocols :as protocols])
+            [hive-hot.protocols :as protocols]
+            [hive-hot.pinned :as pinned])
   (:import [java.io File]))
 
 ;; =============================================================================
@@ -620,6 +621,12 @@
    mtime (see scope-plan): the repair for an image that diverged from disk
    without any file changing.
 
+   opts :refresh-pinned? (default true): an admitted file whose namespace the
+   pass will not reload (config :no-reload, a pinned protocol definer) is
+   refreshed in place by hive-hot.pinned before the pass, and retried after
+   it when a form failed, so the dependents the pass reloads find the vars
+   the pinned source gained.
+
    A pass also runs when nothing under the roots changed but clj-reload holds
    work an earlier pass left queued (a namespace unloaded and never loaded, or
    one a caller queued): that work would otherwise wait for an unrelated edit.
@@ -665,7 +672,10 @@
                                   definer (present only when non-empty)
      :pinned-protocols [{:ns :reason :implementors} ...]
                                   protocol definers in the cascade NOT reloaded
-                                  in place (present only when non-empty)"
+                                  in place (present only when non-empty)
+     :pinned-refreshed [{:ns :file :evaluated :new :types :kept :drift :errors} ...]
+                                  pinned namespaces refreshed in place (present
+                                  only when one was)"
   ([roots] (reload-scoped! roots {}))
   ([roots opts]
    (ensure-initialized!)
@@ -681,11 +691,16 @@
          skipped  (nses-of (:skipped plan))
          dragged  (nses-of (:dragged plan))
          clj-opts (select-keys opts [:log-fn])
-         result   (if (or (:since plan) pending?)
-                    (-> (run-clj-reload! plan clj-opts)
-                        (complete-protocol-cascade! plan clj-opts))
-                    {:unloaded [] :loaded []})
-         _        (record-loaded! (:old-since plan) (:loaded result))
+         targets  (when (:refresh-pinned? opts true)
+                    (pinned/targets plan (:no-reload (reload-config)) #(file-namespaces state %)))
+         pass!    (fn []
+                    (if (or (:since plan) pending?)
+                      (-> (run-clj-reload! plan clj-opts)
+                          (complete-protocol-cascade! plan clj-opts))
+                      {:unloaded [] :loaded []}))
+         [result refreshed] (if (seq targets) (pinned/around! targets pass!) [(pass!) nil])
+         clean    (into [] (comp (filter #(empty? (:errors %))) (map :ns)) refreshed)
+         _        (record-loaded! (:old-since plan) (concat (:loaded result) clean))
          multi    (multi-file-namespaces (:loaded result))
          out      (finish! result start)]
      (cond-> (assoc out
@@ -698,6 +713,7 @@
                     :pending? (and pending? (nil? (:since plan))))
        (seq (:withheld plan)) (assoc :withheld (mapv str (sort (:withheld plan))))
        (seq (:pinned plan))   (assoc :pinned-protocols (protocols/pinned-report (:pinned plan)))
+       (seq refreshed)        (assoc :pinned-refreshed (pinned/wire-report refreshed))
        (seq multi)            (assoc :multi-file multi)))))
 
 (defn reload!
