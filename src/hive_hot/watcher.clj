@@ -75,21 +75,28 @@
            FileVisitResult/CONTINUE))))))
 
 (defn- process-events!
-  "Process events from a watch key, calling callback for each."
-  [^WatchKey key callback key->path]
-  (let [dir-path (get key->path key)]
-    (doseq [event (.pollEvents key)]
-      (let [kind (.kind event)
-            context (.context event)
-            file-path (when (and dir-path context)
-                        (str (.resolve (path->Path dir-path) (str context))))]
-        (when (and file-path (not= kind StandardWatchEventKinds/OVERFLOW))
-          (try
-            (callback {:file file-path
-                       :type (event-kind->type kind)})
-            (catch Exception e
-              (println "Watcher callback error:" (.getMessage e)))))))
-    (.reset key)))
+  "Process events from a watch key, calling callback for each.
+
+   `only` is {dir #{file-name}} for dirs registered solely because a single
+   FILE in them was asked for (see `start!`): events for their other entries
+   are dropped, so watching `deps.edn` does not report every sibling of it."
+  ([key callback key->path] (process-events! key callback key->path {}))
+  ([^WatchKey key callback key->path only]
+   (let [dir-path (get key->path key)
+         allowed  (get only dir-path)]
+     (doseq [event (.pollEvents key)]
+       (let [kind (.kind event)
+             context (.context event)
+             file-path (when (and dir-path context
+                                  (or (nil? allowed) (contains? allowed (str context))))
+                         (str (.resolve (path->Path dir-path) (str context))))]
+         (when (and file-path (not= kind StandardWatchEventKinds/OVERFLOW))
+           (try
+             (callback {:file file-path
+                        :type (event-kind->type kind)})
+             (catch Exception e
+               (println "Watcher callback error:" (.getMessage e)))))))
+     (.reset key))))
 
 (defn- watch-loop
   "Main watch loop - polls for events and dispatches to callback."
@@ -97,7 +104,7 @@
   (while (:running? @state)
     (try
       (when-let [^WatchKey key (.poll service 100 TimeUnit/MILLISECONDS)]
-        (process-events! key callback @key->path))
+        (process-events! key callback @key->path (:only @state {})))
       (catch java.nio.file.ClosedWatchServiceException _
         ;; Service closed, exit loop
         nil)
@@ -106,6 +113,59 @@
         nil)
       (catch Exception e
         (println "Watch loop error:" (.getMessage e))))))
+
+(def ^:private no-follow (into-array java.nio.file.LinkOption []))
+
+(defn- register-paths!
+  "Register `paths` with `service`. A directory is registered RECURSIVELY (Java
+   WatchService only watches a dir's immediate entries). A regular FILE (e.g.
+   deps.edn) registers its parent dir NON-recursively and records the file name
+   under `[:only dir]` in `state`, so that dir reports only the named files
+   rather than every sibling (see `process-events!`). A dir asked for in its own
+   right drops any such filter: it must see every entry. Safe to call on a
+   running watcher; an already-registered dir is not registered twice."
+  [service state key->path paths]
+  (doseq [path paths]
+    (let [^Path p (.toAbsolutePath (path->Path path))
+          known? (fn [d] (some #{d} (vals @key->path)))]
+      (cond
+        (Files/isRegularFile p no-follow)
+        (when-let [parent (.getParent p)]
+          (let [dir (str parent)]
+            (when-not (known? dir)
+              (try
+                (swap! key->path assoc (register-path! service dir) dir)
+                (catch Exception e
+                  (println "Could not register directory:" dir "-" (.getMessage e)))))
+            ;; A dir already watched in full (itself or an ancestor asked for
+            ;; as a dir) keeps seeing every entry; otherwise filter to the file.
+            (swap! state
+                   (fn [s]
+                     (if (some #(or (= % dir) (.startsWith ^String dir (str % "/"))) (:full s))
+                       s
+                       (update-in s [:only dir] (fnil conj #{}) (str (.getFileName p))))))))
+
+        (Files/isDirectory p no-follow)
+        (do (register-recursive! service (str p) key->path)
+            (swap! state (fn [s]
+                           (let [d (str p)
+                                 covered (filter #(or (= % d) (.startsWith ^String % (str d "/")))
+                                                 (keys (:only s)))]
+                             (-> s
+                                 (update :full (fnil conj #{}) d)
+                                 (update :only #(apply dissoc (or % {}) covered)))))))
+
+        :else nil))))
+
+(defn add-paths!
+  "Start watching `paths` (dirs or files) on an ALREADY RUNNING `watcher`
+   without restarting it, so no event window is lost. Returns true when the
+   watcher was running and the paths were registered, nil otherwise."
+  [watcher paths]
+  (let [{:keys [service state key->path]} watcher]
+    (when (and state (:running? @state))
+      (register-paths! service state key->path paths)
+      true)))
 
 (defrecord WatchServiceWatcher [service state key->path]
   FileWatcher
@@ -120,10 +180,7 @@
                  (do (reset! started? true)
                      {:running? true}))))
       (when @started?
-        ;; Register all paths RECURSIVELY - Java WatchService only watches immediate dir
-        ;; FIX: Walk subdirectories to detect changes in nested source files
-        (doseq [path paths]
-          (register-recursive! service path key->path))
+        (register-paths! service state key->path paths)
         ;; Start watch thread
         (let [thread (Thread.
                       (fn [] (watch-loop service state callback key->path))
