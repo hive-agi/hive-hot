@@ -61,6 +61,26 @@
 ;; {canonical-dir #{owner ...}}: who asked for a dir through extend-init!
 ;; (see hive-hot.dirs). remove-dirs! only drops a dir no OTHER owner claims.
 (defonce ^:private dir-claims (atom {}))
+;; {canonical-path #{owner ...}}: EMIT-ONLY watch paths (dirs or single files)
+;; claimed through add-watch-dirs!. The watcher reports :file/changed for them;
+;; clj-reload never tracks them. Kept apart from dir-claims on purpose: what a
+;; consumer wants to HEAR about is not what the image should RELOAD.
+(defonce ^:private watch-claims (atom {}))
+
+(defn watch-set
+  "The paths a watcher must register: the reload `dirs` followed by the
+   emit-only `extra` paths, each once by canonical path, the first spelling
+   winning. Pure. With no extras it is exactly `dirs`, which is what keeps the
+   default watcher's behaviour unchanged."
+  [dirs extra]
+  (let [canon (fn [p] (.getCanonicalPath (io/file p)))]
+    (first
+     (reduce (fn [[out seen] p]
+               (let [c (canon p)]
+                 (if (seen c) [out seen] [(conj out p) (conj seen c)])))
+             [[] #{}]
+             (concat dirs extra)))))
+
 
 (defn- clj-var
   "A clj-reload var by name, private or not — find-var skips the compiler's
@@ -840,6 +860,7 @@
   (clojure.core/reset! seen {})
   (clojure.core/reset! core-dirs #{})
   (clojure.core/reset! dir-claims {})
+  (clojure.core/reset! watch-claims {})
   nil)
 
 ;; =============================================================================
@@ -1070,14 +1091,19 @@
 
    Returns :watching on success."
   ([] (init-with-watcher! {}))
-  ([{:keys [dirs claim-checker debounce-ms no-reload no-unload watch-local-roots?]
+  ([{:keys [dirs claim-checker debounce-ms no-reload no-unload watch-local-roots? watch-dirs]
      :or {dirs ["src"]
           claim-checker (constantly #{})
           debounce-ms 100
           watch-local-roots? true}
      :as opts}]
    (let [dirs (into (vec dirs) (remove (set (map canonical dirs)))
-                    (if watch-local-roots? (current-local-root-dirs) []))]
+                    (if watch-local-roots? (current-local-root-dirs) []))
+         ;; WHAT EMITS vs WHAT RELOADS. `dirs` are the reload dirs clj-reload
+         ;; tracks; the watcher additionally emits :file/changed for the
+         ;; emit-only paths (opts :watch-dirs plus every `add-watch-dirs!`
+         ;; claim). Defaults to the reload dirs alone: unchanged behaviour.
+         watched (watch-set dirs (concat watch-dirs (keys @watch-claims)))]
      ;; Initialize clj-reload — extending, never resetting, an initialized registry
      (ensure-init! (cond-> {:dirs dirs}
                      no-reload (assoc :no-reload no-reload)
@@ -1103,18 +1129,21 @@
        ;; Callback receives a set of file paths
        (let [debouncer (create-debouncer
                         (fn [files]
-                          ;; Emit file/changed events for each file
+                          ;; Emit file/changed for EVERY watched file...
                           (doseq [file files]
                             (events/emit-file-changed! (str file) :modify))
-                          ;; Trigger reload
-                          (reload-scoped! (changed-roots dirs files)))
+                          ;; ...but reload only for files under a reload dir.
+                          ;; An empty root set must NOT reach reload-scoped!,
+                          ;; which reads empty as "every tracked dir".
+                          (when-let [roots (seq (changed-roots dirs files))]
+                            (reload-scoped! (vec roots))))
                         claim-checker
                         :cooldown-ms debounce-ms)
              ;; Create watcher
              watcher (create-watcher)]
 
          ;; Start watcher with callback that feeds events to debouncer
-         (watcher-start! watcher dirs
+         (watcher-start! watcher watched
                          (fn [{:keys [file type]}]
                            (handle-event! debouncer {:file file :type type})))
 
@@ -1124,6 +1153,7 @@
                  {:watcher watcher
                   :debouncer debouncer
                   :dirs dirs
+                  :watched watched
                   :opts (assoc opts :dirs dirs :watch-local-roots? false)
                   :stop-fn (fn []
                              (watcher-stop! watcher)
@@ -1145,11 +1175,49 @@
 
    Returns nil if not watching, or map with:
    - :watching? true
-   - :dirs watched directories"
+   - :dirs        the RELOAD dirs (what clj-reload tracks)
+   - :watch-dirs  every path the watcher EMITS :file/changed for: the reload
+                  dirs plus the emit-only paths (see `add-watch-dirs!`)"
   []
   (when-let [state @watcher-state]
     {:watching? true
-     :dirs (:dirs state)}))
+     :dirs (:dirs state)
+     :watch-dirs (or (:watched state) (:dirs state))}))
+
+(defn add-watch-dirs!
+  "Claim `dirs` (directories or single files, e.g. deps.edn) as EMIT-ONLY watch
+   paths for `owner`: the watcher reports :file/changed for them but clj-reload
+   never tracks them, so the reload set is unchanged. A running watcher picks
+   them up in place, without a restart (no lost event window); a watcher started
+   later includes them. Idempotent.
+
+   Returns {:watch-dirs [canonical ...] :added [canonical ...] :live? bool}:
+   :live? true when a running watcher now covers them."
+  [{:keys [dirs owner]}]
+  (let [paths (into [] (comp (filter #(.exists (io/file %))) (map canonical) (distinct)) dirs)
+        before (set (keys @watch-claims))
+        _ (swap! watch-claims dirs/claim owner paths)
+        added (filterv (complement before) paths)
+        live? (when-let [{:keys [watcher dirs] :as st} @watcher-state]
+                (let [add! (resolve 'hive-hot.watcher/add-paths!)
+                      new  (remove (set (:watched st)) paths)]
+                  (when (or (empty? new) (add! watcher new))
+                    (swap! watcher-state update :watched #(watch-set (or % dirs) new))
+                    true)))]
+    {:watch-dirs (vec (sort (keys @watch-claims))) :added added :live? (boolean live?)}))
+
+(defn remove-watch-dirs!
+  "Release `owner`'s emit-only claim on `dirs`. A path another owner still
+   claims stays watched. A running watcher is restarted without the released
+   paths. Never touches the reload dirs. Returns {:watch-dirs [...] :removed [...]}."
+  [{:keys [dirs owner]}]
+  (let [paths (mapv canonical dirs)
+        plan  (dirs/plan-removal (vec (keys @watch-claims)) paths #{} @watch-claims owner)]
+    (reset! watch-claims (:claims plan))
+    (when (and (seq (:removed plan)) @watcher-state)
+      (when-let [opts (:opts @watcher-state)]
+        (init-with-watcher! (update opts :watch-dirs #(remove (set (:removed plan)) (map canonical %))))))
+    {:watch-dirs (vec (sort (keys @watch-claims))) :removed (:removed plan)}))
 
 (defn watching-paths
   "Get list of directories being watched.
